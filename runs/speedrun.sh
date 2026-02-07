@@ -70,9 +70,9 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # d16 model on single H100 NVL with FP8 training
-python -m scripts.base_train -- --depth=16 --target-param-data-ratio=10 --device-batch-size=32 --total-batch-size=131072 --fp8 --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d16
+python -m scripts.base_train --depth=16 --target-param-data-ratio=10 --device-batch-size=32 --total-batch-size=131072 --fp8 --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d16
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
-python -m scripts.base_eval -- --device-batch-size=16
+python -m scripts.base_eval --device-batch-size=16
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
