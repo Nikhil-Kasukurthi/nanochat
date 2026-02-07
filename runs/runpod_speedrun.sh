@@ -2,20 +2,20 @@
 set -e
 
 # RunPod variant of speedrun.sh — trains a d16 LLM (pretraining + finetuning)
-# on a single A100 PCIe GPU. Takes approximately 2-3 hours to complete.
+# on a single H100 NVL GPU. Takes approximately 1-2 hours to complete.
 #
 # RunPod-specific fixes:
 # - Adds ~/.local/bin to PATH (where uv installs on RunPod)
 # - Sources uv env file for proper shell integration
 # - Installs python3-dev (needed for torchao FP8 JIT CUDA compilation)
 # - Installs vim/tmux for convenience during long training runs
-# A100 notes:
-# - No FP8 support (Ampere architecture)
-# - No FA3 support, uses SDPA fallback with --window-pattern=L
+# H100 notes:
+# - FP8 training enabled for ~10-20% speedup
+# - FA3 available, uses default SSSL sliding window pattern
 
 # 1) Example launch (simplest):
 # bash runs/runpod_speedrun.sh
-# 2) Example launch in a screen session (because the run takes ~2-3 hours):
+# 2) Example launch in a screen session (because the run takes ~1-2 hours):
 # screen -L -Logfile runs/runpod_speedrun.log -S speedrun bash runs/runpod_speedrun.sh
 # 3) Example launch with wandb logging, but see below for setting up wandb first:
 # WANDB_RUN=speedrun screen -L -Logfile runs/runpod_speedrun.log -S speedrun bash runs/runpod_speedrun.sh
@@ -90,10 +90,10 @@ python -m scripts.tok_eval
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
-# d16 model on single A100 (no FP8, use full attention for SDPA efficiency)
-python -m scripts.base_train --depth=24 --target-param-data-ratio=10 --device-batch-size=16 --total-batch-size=131072 --window-pattern=L --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d16
+# d16 model on single H100 NVL with FP8 training
+python -m scripts.base_train --depth=16 --target-param-data-ratio=10 --device-batch-size=64 --total-batch-size=131072 --fp8 --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d16
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
-python -m scripts.base_eval --device-batch-size=16
+python -m scripts.base_eval --device-batch-size=32
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
@@ -103,7 +103,7 @@ python -m scripts.base_eval --device-batch-size=16
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run SFT and eval the model
-python -m scripts.chat_sft -- --device-batch-size=16 --total-batch-size=32768 --run=$WANDB_RUN
+python -m scripts.chat_sft --device-batch-size=32 --total-batch-size=32768 --run=$WANDB_RUN
 python -m scripts.chat_eval -- -i sft
 
 # chat with the model over CLI! Leave out the -p to chat interactively
