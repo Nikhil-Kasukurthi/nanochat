@@ -91,7 +91,7 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # d16 model on single A100 (no FP8, use full attention for SDPA efficiency)
-python -m scripts.base_train --depth=24 --target-param-data-ratio=10 --device-batch-size=32 --total-batch-size=131072 --window-pattern=L --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d16
+python -m scripts.base_train --depth=24 --target-param-data-ratio=10 --device-batch-size=16 --total-batch-size=131072 --window-pattern=L --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d16
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
 python -m scripts.base_eval --device-batch-size=16
 
@@ -103,7 +103,7 @@ python -m scripts.base_eval --device-batch-size=16
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run SFT and eval the model
-python -m scripts.chat_sft -- --device-batch-size=32 --total-batch-size=32768 --run=$WANDB_RUN
+python -m scripts.chat_sft -- --device-batch-size=16 --total-batch-size=32768 --run=$WANDB_RUN
 python -m scripts.chat_eval -- -i sft
 
 # chat with the model over CLI! Leave out the -p to chat interactively
