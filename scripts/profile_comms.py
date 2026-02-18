@@ -232,6 +232,7 @@ if profile_comms:
 
     original_step = optimizer.step.__func__  # unbound method
 
+    @torch.no_grad()
     def instrumented_step(self):
         """Instrumented version of DistMuonAdamW.step() with 3-phase timing."""
         rank = dist.get_rank()
