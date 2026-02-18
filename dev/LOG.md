@@ -4,6 +4,38 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-02-17: Pretraining Data Mixture Experiment (negative)
+
+Tried [hynky/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT](https://huggingface.co/datasets/hynky/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT), a mixture of FinePDFs, DCLM, and FineWeb-EDU. Slightly worse on both model sizes tested:
+
+- d26 (GPT-2): CORE 0.2602 → 0.2549
+- d18: CORE 0.199 → 0.192
+
+This is the fourth failed attempt to beat pure FineWeb-EDU on CORE score.
+
+---
+
+## 2026-02-16: SFT Script Upgrades
+
+Brought `chat_sft.py` up to parity with `base_train.py` and tuned settings based on SFT sweeps.
+
+Tuning:
+
+- **Optimizer warm-start** (`--load-optimizer=1`, default on): loads pretrained momentum buffers via new `load_optimizer_state()` in `checkpoint_manager.py`. LRs are reset to fresh SFT values after load. Loading the optimizer works slightly better but not by too much.
+- **LR schedule**: replaced "constant 80%, linear to 0" with warmup/constant/warmdown matching `base_train.py` (`--warmup-ratio`, `--warmdown-ratio`, `--init-lr-frac`, `--final-lr-frac`). Similar to pretraining, warmdown ratio of 0.5 worked the best. `--init-lr-frac` changed from 1.0 slightly lower to 0.8.
+- **LR tuning**: attempted to tune all the individual LRs (e.g. does SFT prefer lower LR for embeddings? etc.) but all of this produced negative results.
+- **Data mixture**: MMLU epochs 1→3, GSM8K epochs 2→4 (confirmed best from sweeps). Epoch counts now configurable via `--mmlu-epochs` / `--gsm8k-epochs`. Might remove these in the future though.
+
+Quality of life, footguns, minor fixes:
+
+- **Hyperparameter inheritance**: SFT now inherits batch sizes and LRs from the pretrained checkpoint metadata by default (CLI overrides still work). Also saved `total_batch_size` to `base_train.py` checkpoint metadata.
+- **GC management**: disabled Python GC after step 1 to avoid ~500ms pauses (manual collect every 5000 steps), same as base pretraining.
+- **ChatCORE eval**: periodic eval during SFT (`--chatcore-every=200`) across all 6 tasks, logged to wandb.
+- **MFU**: uses `get_peak_flops()` for actual GPU instead of hardcoded H100 value.
+- Removed `--dry-run` and `--dtype` flags. All ranks now participate in checkpoint save.
+
+---
+
 ## 2026-02-05: Auto Batch Size Scaling
 
 ### Background
