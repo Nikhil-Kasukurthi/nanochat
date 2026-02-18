@@ -4,6 +4,16 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-02-17: Pretraining Data: FineWeb (negative)
+
+Tried vanilla fineweb instead of fineweb-edu dataset. Significantly, shockingly worse results:
+
+- d26 (GPT-2): CORE 0.2602 → 0.2241
+
+This is the fifth failed attempt to beat pure FineWeb-EDU on CORE score.
+
+---
+
 ## 2026-02-17: Pretraining Data Mixture Experiment (negative)
 
 Tried [hynky/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT](https://huggingface.co/datasets/hynky/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT), a mixture of FinePDFs, DCLM, and FineWeb-EDU. Slightly worse on both model sizes tested:
