@@ -303,7 +303,17 @@ step_times = []  # wall-clock per step (post-warmup only)
 
 print0(f"\nRunning {total_steps} steps ({warmup_steps} warmup + {num_steps} profiled)...")
 
-if profile_comms:
+# Detect if running under Nsight Systems (nsys sets this env var).
+# CUPTI only allows one subscriber — nsys claims it for kernel tracing,
+# so we must skip PyTorch Profiler's CUDA activities to avoid the conflict.
+# NVTX markers and CUDA events (used for phase timing) are NOT CUPTI-based
+# and work fine alongside nsys.
+under_nsys = "NSYS_PROFILING_SESSION_ID" in os.environ
+if under_nsys:
+    print0("Detected Nsight Systems — skipping PyTorch Profiler (CUPTI conflict).")
+    print0("NVTX markers and CUDA event timers remain active.")
+
+if profile_comms and not under_nsys:
     # Wrap with torch.profiler for Chrome/TensorBoard traces
     profiler_schedule = torch.profiler.schedule(
         wait=0,
