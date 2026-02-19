@@ -24,7 +24,7 @@ WARMUP_STEPS=${WARMUP_STEPS:-3}
 DEVICE_BATCH_SIZE=${DEVICE_BATCH_SIZE:-32}
 MAX_SEQ_LEN=${MAX_SEQ_LEN:-2048}
 OUTPUT_DIR=${OUTPUT_DIR:-"profile_output"}
-NSYS=${NSYS:-0}  # set NSYS=1 to wrap with nsys profile
+NSYS=${NSYS:-1}  # set NSYS=1 to wrap with nsys profile
 
 echo "=== nanochat Communication Profiler (RunPod) ==="
 echo "Config: depth=$DEPTH gpus=$NUM_GPUS steps=$NUM_STEPS warmup=$WARMUP_STEPS"
@@ -106,11 +106,12 @@ if [ "$NSYS" = "1" ]; then
     NSYS_OUTPUT="${OUTPUT_DIR}/nsys_trace"
     echo "Running under nsys profile (output: ${NSYS_OUTPUT}.nsys-rep)"
     nsys profile \
-        -o "$NSYS_OUTPUT" \
+       --python-backtrace=cuda \
+       --pytorch autograd-shapes-nvtx \
+        --output profile \
         --trace=cuda,nvtx,osrt \
         --capture-range=cudaProfilerApi \
-        --stop-on-range-end=true \
-        $PROFILE_CMD
+        torchrun --standalone --nproc_per_node=2 -m scripts.profile_comms -- --depth 12 --num-steps 10 --warmup-steps 3 --device-batch-size 8 --max-seq-len 512 --output-dir profile_output
 else
     # Standard run — PyTorch Profiler traces + summary
     # NVTX markers are present but dormant (near-zero overhead without nsys)
