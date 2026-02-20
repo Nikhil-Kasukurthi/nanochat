@@ -39,6 +39,7 @@ parser.add_argument("--warmup-steps", type=int, default=10)
 parser.add_argument("--device-batch-size", type=int, default=32)
 parser.add_argument("--max-seq-len", type=int, default=2048)
 parser.add_argument("--output-dir", type=str, default="profile_output")
+parser.add_argument("--fp8", action="store_true", help="enable FP8 training (matches speedrun)")
 args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
@@ -75,6 +76,24 @@ model.init_weights()
 
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Model: d{args.depth} ({num_params:,} params) | dim={model_dim} | heads={num_heads}")
+
+# FP8 conversion (must happen before torch.compile)
+if args.fp8:
+    from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
+    import torch.nn as nn
+    def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
+        if not isinstance(mod, nn.Linear):
+            return False
+        if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
+            return False
+        if min(mod.in_features, mod.out_features) < 128:
+            return False
+        return True
+    fp8_config = Float8LinearConfig.from_recipe_name("tensorwise")
+    num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
+    convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
+    num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
+    print0(f"FP8 enabled: converted {num_fp8}/{num_linear} linear layers")
 
 model = torch.compile(model, dynamic=False)
 optimizer = model.setup_optimizer()
