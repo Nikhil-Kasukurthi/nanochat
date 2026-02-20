@@ -54,16 +54,12 @@ NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 NSYS=${NSYS:-0}
 
 PROFILE_CMD="torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms \
-    -- --depth 26 --num-steps 10 --warmup-steps 3 --device-batch-size 32 --output-dir profile_output"
+    -- --depth 26 --num-steps 10 --warmup-steps 3 --device-batch-size 16 --output-dir profile_output"
 
-if [ "$NSYS" = "1" ]; then
-    nsys profile \
-        --python-backtrace=cuda \
-        --pytorch autograd-shapes-nvtx \
-        -o profile_output/nsys_trace \
-        --trace=cuda,nvtx,osrt \
-        --capture-range=cudaProfilerApi \
-        $PROFILE_CMD
-else
-    $PROFILE_CMD
-fi
+nsys profile \
+      --python-backtrace=cuda \
+      --pytorch autograd-shapes-nvtx \
+      -o profile_output/nsys_trace \
+      --trace=cuda,nvtx,osrt \
+      --capture-range=cudaProfilerApi \
+      $PROFILE_CMD
