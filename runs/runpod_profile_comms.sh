@@ -54,7 +54,7 @@ NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 NSYS=${NSYS:-0}
 
 PROFILE_CMD="torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms \
-    -- --depth 26 --num-steps 10 --warmup-steps 3 --device-batch-size 16 --output-dir profile_output"
+    -- --depth 26 --num-steps 10 --warmup-steps 3 --device-batch-size 16 --fp8 --output-dir profile_output"
 
 nsys profile \
       --python-backtrace=cuda \
