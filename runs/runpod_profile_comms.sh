@@ -17,7 +17,7 @@ mkdir -p $NANOCHAT_BASE_DIR
 # -----------------------------------------------------------------------------
 # System dependencies
 
-apt-get update -qq && apt-get install -y -qq python3-dev vim tmux 2>/dev/null
+apt-get update -qq && apt-get install -y -qq python3-dev vim tmux rsync 2>/dev/null
 
 # Install nsys if not present
 if ! command -v nsys &> /dev/null; then
@@ -46,6 +46,7 @@ python -m nanochat.dataset -n 8
 # train tokenizer if not already present
 [ -f "$NANOCHAT_BASE_DIR/tok65536.model" ] || python -m scripts.tok_train
 
+mkdir profile_output
 # -----------------------------------------------------------------------------
 # Profile the d26 model on all available GPUs
 # d26 is the model that reaches GPT-2 performance in the full training run
