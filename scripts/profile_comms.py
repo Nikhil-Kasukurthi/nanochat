@@ -222,6 +222,8 @@ for step in range(total_steps):
         (loss / grad_accum_steps).backward()
         x, y = next(train_loader)
 
+    # Drain all backward kernels so optimizer comm timings are clean in nsys
+    torch.cuda.synchronize()
     optimizer.step()
     model.zero_grad(set_to_none=True)
 
