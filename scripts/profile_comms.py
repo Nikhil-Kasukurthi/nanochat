@@ -237,6 +237,23 @@ for step in range(total_steps):
 
     label = "warmup" if is_warmup else "prof"
     print0(f"  step {step:3d} [{label:6s}] {dt_ms:.1f} ms")
+profiled_phases = phase_timings[args.warmup_steps:]
+avg_step = sum(step_times) / len(step_times)
+avg_p1 = sum(t["phase1_ms"] for t in profiled_phases) / len(profiled_phases)
+avg_p2 = sum(t["phase2_ms"] for t in profiled_phases) / len(profiled_phases)
+avg_p3 = sum(t["phase3_ms"] for t in profiled_phases) / len(profiled_phases)
+avg_opt = sum(t["total_ms"] for t in profiled_phases) / len(profiled_phases)
+
+# Console summary
+print0(f"\n{'='*50}")
+print0(f"  GPU: {torch.cuda.get_device_name(0)} x {ddp_world_size}")
+print0(f"  Model: d{args.depth} ({num_params:,} params)")
+print0(f"  Avg step:       {avg_step:7.1f} ms")
+print0(f"  Optimizer step: {avg_opt:7.1f} ms ({avg_opt/avg_step*100:.1f}%)")
+print0(f"    Phase 1 (reduces):        {avg_p1:7.1f} ms ({avg_p1/avg_step*100:.1f}%)")
+print0(f"    Phase 2 (compute+gather): {avg_p2:7.1f} ms ({avg_p2/avg_step*100:.1f}%)")
+print0(f"    Phase 3 (wait gathers):   {avg_p3:7.1f} ms ({avg_p3/avg_step*100:.1f}%)")
+print0(f"{'='*50}")
 
 torch.cuda.cudart().cudaProfilerStop()
 
@@ -299,6 +316,7 @@ if master_process:
             ],
         },
     }
+    print(results)
     json_path = os.path.join(args.output_dir, "profile_results.json")
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
