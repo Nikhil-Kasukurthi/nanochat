@@ -46,21 +46,35 @@ python -m nanochat.dataset -n 8
 # train tokenizer if not already present
 [ -f "$NANOCHAT_BASE_DIR/tok65536.model" ] || python -m scripts.tok_train
 
-mkdir profile_output
+mkdir -p profile_output
 # -----------------------------------------------------------------------------
-# Profile the d26 model on all available GPUs
-# d26 is the model that reaches GPT-2 performance in the full training run
+# Profile d12 and d26 models on all available GPUs
+# d12 is the smallest standard model; d26 reaches GPT-2 performance
 
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
-NSYS=${NSYS:-0}
 
-PROFILE_CMD="torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms \
-    -- --depth 26 --num-steps 10 --warmup-steps 3 --device-batch-size 16 --fp8 --output-dir profile_output"
+# --- d12 profiling ---
 
+PROFILE_CMD_D12="torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms \
+    -- --depth 12 --num-steps 10 --warmup-steps 3 --device-batch-size 32 --fp8 --output-dir profile_output/d12"
+mkdir -p profile_output/d12/nsys_trace
 nsys profile \
       --python-backtrace=cuda \
       --pytorch autograd-shapes-nvtx \
-      -o profile_output/nsys_trace \
+      -o profile_output/d12/nsys_trace \
       --trace=cuda,nvtx,osrt \
       --capture-range=cudaProfilerApi \
-      $PROFILE_CMD
+      $PROFILE_CMD_D12
+
+# --- d26 profiling ---
+
+PROFILE_CMD_D26="torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms \
+    -- --depth 26 --num-steps 10 --warmup-steps 3 --device-batch-size 16 --fp8 --output-dir profile_output/d26"
+mkdir -p profile_output/d26/nsys_trace
+nsys profile \
+      --python-backtrace=cuda \
+      --pytorch autograd-shapes-nvtx \
+      -o profile_output/d26/nsys_trace \
+      --trace=cuda,nvtx,osrt \
+      --capture-range=cudaProfilerApi \
+      $PROFILE_CMD_D26
