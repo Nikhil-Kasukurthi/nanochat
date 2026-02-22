@@ -1,18 +1,18 @@
 #!/bin/bash
 
-# This script is configured to train your own GPT-2 grade LLM (pretraining + finetuning)
-# It is designed to run on a blank 8XH100 GPU node and takes approximately 3 hours to complete.
+# This script is configured to train your own d16 LLM (pretraining + finetuning)
+# It is designed to run on a single H100 NVL GPU and takes approximately 1 hour to complete.
 
 # 1) Example launch (simplest):
 # bash runs/speedrun.sh
-# 2) Example launch in a screen session (because the run takes ~3 hours):
+# 2) Example launch in a screen session (because the run takes ~1 hour):
 # screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
 # 3) Example launch with wandb logging, but see below for setting up wandb first:
 # WANDB_RUN=speedrun screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
 
 # Default intermediate artifacts directory is in ~/.cache/nanochat
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+export NANOCHAT_BASE_DIR="~/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
 # -----------------------------------------------------------------------------
@@ -57,7 +57,7 @@ python -m nanochat.dataset -n 8
 # Immediately also kick off downloading more shards in the background while tokenizer trains
 # Approximately 350 shards are needed for 10B tokens of data for pretraining.
 # The maximum total number of shards available in the entire dataset is 1822.
-python -m nanochat.dataset -n 370 &
+python -m nanochat.dataset -n 100 &
 DATASET_DOWNLOAD_PID=$!
 # train the tokenizer with vocab size 2**15 = 32768 on ~2B characters of data
 python -m scripts.tok_train
@@ -69,10 +69,10 @@ python -m scripts.tok_eval
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
-# d26 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8.25)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=26 --target-param-data-ratio=8.25 --device-batch-size=16 --fp8 --run=$WANDB_RUN
+# d16 model on single H100 NVL with FP8 training
+python -m scripts.base_train --depth=16 --target-param-data-ratio=10 --device-batch-size=32 --total-batch-size=131072 --fp8 --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d16
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+python -m scripts.base_eval --device-batch-size=16
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
@@ -82,8 +82,8 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run SFT and eval the model
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16 --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+python -m scripts.chat_sft -- --device-batch-size=32 --total-batch-size=32768 --run=$WANDB_RUN
+python -m scripts.chat_eval -- -i sft
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"
