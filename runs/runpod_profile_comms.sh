@@ -15,6 +15,21 @@ export NANOCHAT_BASE_DIR="/workspace/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
 # -----------------------------------------------------------------------------
+# CUDA sanity check — fail fast if the pod's GPU/driver setup is broken.
+# This catches "CUDA unknown error" from mismatched drivers, bad templates, etc.
+# before we spend minutes installing dependencies and downloading data.
+
+echo "Checking CUDA availability..."
+nvidia-smi || { echo "FATAL: nvidia-smi failed — no GPU driver found."; exit 1; }
+python3 -c "
+import torch
+torch.cuda.init()
+n = torch.cuda.device_count()
+assert n > 0, 'No CUDA devices found after init'
+print(f'CUDA OK: {n} device(s), driver {torch.version.cuda}, {torch.cuda.get_device_name(0)}')
+" || { echo "FATAL: CUDA initialization failed. Pod template may be misconfigured."; exit 1; }
+
+# -----------------------------------------------------------------------------
 # System dependencies
 
 apt-get update -qq && apt-get install -y -qq python3-dev vim tmux rsync 2>/dev/null
