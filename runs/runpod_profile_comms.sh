@@ -25,33 +25,7 @@ nvidia-smi || { echo "FATAL: nvidia-smi failed — no GPU driver found."; exit 1
 DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
 echo "NVIDIA driver version: $DRIVER_VER"
 
-python3 -c "
-import torch, sys, os
 
-print(f'PyTorch {torch.__version__}, built with CUDA {torch.version.cuda}')
-
-try:
-    torch.cuda.init()
-except Exception as e:
-    print(f'\nCUDA INIT FAILED: {e}')
-    print()
-    print('Common fixes for H100:')
-    print('  1. Driver too old — need >= 535 for CUDA 12.2, >= 570 for CUDA 12.8')
-    print('     -> Use a pod template with a newer NVIDIA driver')
-    print('  2. nvidia-persistenced not running (common on PCIe pods)')
-    print('     -> Try: nvidia-persistenced --persistence-mode && nvidia-smi -pm 1')
-    print('  3. GPU stuck in bad state')
-    print('     -> Try: nvidia-smi -r  (resets GPU, needs root)')
-    print('  4. CUDA_VISIBLE_DEVICES set incorrectly')
-    print(f'     -> Current value: {repr(os.environ.get(\"CUDA_VISIBLE_DEVICES\", \"<not set>\"))}')
-    sys.exit(1)
-
-n = torch.cuda.device_count()
-assert n > 0, 'No CUDA devices found after init'
-for i in range(n):
-    print(f'  GPU {i}: {torch.cuda.get_device_name(i)}')
-print(f'CUDA OK: {n} device(s) ready')
-" || { echo "FATAL: CUDA initialization failed. See diagnostics above."; exit 1; }
 
 # -----------------------------------------------------------------------------
 # System dependencies
