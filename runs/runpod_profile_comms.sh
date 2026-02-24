@@ -54,6 +54,53 @@ print(f'CUDA OK: {n} device(s) ready')
 " || { echo "FATAL: CUDA initialization failed. See diagnostics above."; exit 1; }
 
 # -----------------------------------------------------------------------------
+# NCCL sanity check — fail fast if inter-GPU communication is broken.
+# This catches NCCL SHM bugs (e.g. corrupt segment names on some NVL containers)
+# before we spend minutes installing dependencies and downloading data.
+# Uses the base image's torchrun + torch (no venv needed).
+
+NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+echo "Checking NCCL communication across $NUM_GPUS GPUs..."
+
+NCCL_CHECK=$(mktemp /tmp/nccl_check_XXXXXX.py)
+cat > "$NCCL_CHECK" << 'PYEOF'
+import torch, torch.distributed as dist, os, sys
+rank = int(os.environ['LOCAL_RANK'])
+torch.cuda.set_device(rank)
+device = torch.device('cuda', rank)
+try:
+    dist.init_process_group(backend='nccl', device_id=device)
+    dist.barrier()
+    t = torch.ones(1024, device=device) * (rank + 1)
+    dist.all_reduce(t)
+    expected = sum(range(1, dist.get_world_size() + 1)) * 1024
+    assert abs(t.sum().item() - expected) < 1e-3, f'all_reduce mismatch: {t.sum().item()} != {expected}'
+    if rank == 0:
+        gpu_name = torch.cuda.get_device_name(0)
+        nccl_ver = '.'.join(str(x) for x in torch.cuda.nccl.version())
+        print(f'NCCL OK: {dist.get_world_size()} GPUs communicating ({gpu_name}, NCCL {nccl_ver})')
+    dist.destroy_process_group()
+except Exception as e:
+    if rank == 0:
+        print(f'\nNCCL HEALTH CHECK FAILED: {e}', file=sys.stderr)
+        print(file=sys.stderr)
+        print('This pod has broken NCCL communication. Common causes:', file=sys.stderr)
+        print('  1. NCCL SHM bug -- corrupt /dev/shm/nccl-* segments (seen on some NVL containers)', file=sys.stderr)
+        print('  2. NCCL version mismatch with driver/CUDA', file=sys.stderr)
+        print('  3. GPU topology not properly exposed to container', file=sys.stderr)
+        print(file=sys.stderr)
+        print('Quick workaround:  NCCL_SHM_DISABLE=1 bash runs/runpod_profile_comms.sh', file=sys.stderr)
+        print('  (WARNING: disabling SHM gives invalid perf numbers on NVL nodes)', file=sys.stderr)
+        print(file=sys.stderr)
+        print('Recommended: terminate this pod and try a different one.', file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
+timeout 60 torchrun --standalone --nproc_per_node=$NUM_GPUS "$NCCL_CHECK" \
+    || { rm -f "$NCCL_CHECK"; echo "FATAL: NCCL check failed. Abort this pod and try another."; exit 1; }
+rm -f "$NCCL_CHECK"
+
+# -----------------------------------------------------------------------------
 # System dependencies
 
 apt-get update -qq && apt-get install -y -qq python3-dev vim tmux rsync 2>/dev/null
@@ -89,8 +136,6 @@ mkdir -p profile_output
 # -----------------------------------------------------------------------------
 # Profile d12 and d26 models on all available GPUs
 # d12 is the smallest standard model; d26 reaches GPT-2 performance
-
-NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 
 # --- d12 profiling ---
 
