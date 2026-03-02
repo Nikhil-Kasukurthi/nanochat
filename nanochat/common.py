@@ -199,34 +199,43 @@ def _parse_cpulist(cpulist_str):
     return cpus
 
 def _set_membind(numa_node):
-    """Set MPOL_BIND memory policy for this process via set_mempolicy(2).
+    """Set MPOL_BIND memory policy for this process via the set_mempolicy syscall.
 
     This is the same thing `numactl --membind=N` does. It ensures all future
     memory allocations (malloc, mmap) land on the specified NUMA node's RAM.
-    Only works on Linux; silently skipped elsewhere.
+    Only works on Linux x86_64; silently skipped elsewhere.
+
+    Uses the raw syscall number instead of libc's set_mempolicy symbol because
+    nsys LD_PRELOADs a dlsym hook that doesn't know about set_mempolicy,
+    causing symbol resolution to fail under profiling.
     """
     import ctypes
-    import ctypes.util
+    import platform
+    if platform.system() != "Linux" or platform.machine() != "x86_64":
+        return False
+    # x86_64 syscall number for set_mempolicy (from asm/unistd_64.h)
+    __NR_set_mempolicy = 238
     MPOL_BIND = 2
     MPOL_F_STATIC_NODES = 1 << 15  # nodemask is absolute, not relative
     try:
-        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        # set_mempolicy(int mode, const unsigned long *nodemask, unsigned long maxnode)
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # long syscall(long number, ...) — variadic, but ctypes handles it
         nodemask = 1 << numa_node
         nodemask_arr = (ctypes.c_ulong * 1)(nodemask)
-        maxnode = ctypes.c_ulong(numa_node + 2)  # must be >= highest bit + 1
-        ret = libc.set_mempolicy(
-            ctypes.c_int(MPOL_BIND | MPOL_F_STATIC_NODES),
-            nodemask_arr,
-            maxnode,
+        maxnode = numa_node + 2  # must be >= highest bit + 1
+        ret = libc.syscall(
+            ctypes.c_long(__NR_set_mempolicy),
+            ctypes.c_long(MPOL_BIND | MPOL_F_STATIC_NODES),
+            ctypes.pointer(nodemask_arr),
+            ctypes.c_ulong(maxnode),
         )
         if ret != 0:
             errno = ctypes.get_errno()
-            logger.warning(f"NUMA: set_mempolicy failed with errno {errno}")
+            logger.warning(f"NUMA: set_mempolicy syscall failed with errno {errno}")
             return False
         return True
     except Exception as e:
-        logger.warning(f"NUMA: set_mempolicy unavailable: {e}")
+        logger.warning(f"NUMA: set_mempolicy syscall unavailable: {e}")
         return False
 
 def numa_pin(local_rank):
