@@ -216,7 +216,6 @@ def _set_membind(numa_node):
     # x86_64 syscall number for set_mempolicy (from asm/unistd_64.h)
     __NR_set_mempolicy = 238
     MPOL_BIND = 2
-    MPOL_F_STATIC_NODES = 1 << 15  # nodemask is absolute, not relative
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         # long syscall(long number, ...) — variadic, but ctypes handles it
@@ -225,7 +224,7 @@ def _set_membind(numa_node):
         maxnode = numa_node + 2  # must be >= highest bit + 1
         ret = libc.syscall(
             ctypes.c_long(__NR_set_mempolicy),
-            ctypes.c_long(MPOL_BIND | MPOL_F_STATIC_NODES),
+            ctypes.c_long(MPOL_BIND),
             ctypes.pointer(nodemask_arr),
             ctypes.c_ulong(maxnode),
         )
