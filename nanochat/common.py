@@ -229,12 +229,9 @@ def _set_membind(numa_node):
             ctypes.c_ulong(maxnode),
         )
         if ret != 0:
-            errno = ctypes.get_errno()
-            logger.warning(f"NUMA: set_mempolicy syscall failed with errno {errno}")
             return False
         return True
-    except Exception as e:
-        logger.warning(f"NUMA: set_mempolicy syscall unavailable: {e}")
+    except Exception:
         return False
 
 def numa_pin(local_rank):
