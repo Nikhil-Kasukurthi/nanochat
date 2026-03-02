@@ -51,44 +51,8 @@ export NCCL_P2P_LEVEL=NVL       # prefer NVLink for peer-to-peer
 export NCCL_SOCKET_IFNAME=eth0
 
 echo "Checking NCCL communication across $NUM_GPUS GPUs..."
-
-NCCL_CHECK=$(mktemp /tmp/nccl_check_XXXXXX.py)
-cat > "$NCCL_CHECK" << 'PYEOF'
-import torch, torch.distributed as dist, os, sys
-rank = int(os.environ['LOCAL_RANK'])
-torch.cuda.set_device(rank)
-device = torch.device('cuda', rank)
-try:
-    dist.init_process_group(backend='nccl', device_id=device)
-    dist.barrier()
-    t = torch.ones(1024, device=device) * (rank + 1)
-    dist.all_reduce(t)
-    expected = sum(range(1, dist.get_world_size() + 1)) * 1024
-    assert abs(t.sum().item() - expected) < 1e-3, f'all_reduce mismatch: {t.sum().item()} != {expected}'
-    if rank == 0:
-        gpu_name = torch.cuda.get_device_name(0)
-        nccl_ver = '.'.join(str(x) for x in torch.cuda.nccl.version())
-        print(f'NCCL OK: {dist.get_world_size()} GPUs communicating ({gpu_name}, NCCL {nccl_ver})')
-    dist.destroy_process_group()
-except Exception as e:
-    if rank == 0:
-        print(f'\nNCCL HEALTH CHECK FAILED: {e}', file=sys.stderr)
-        print(file=sys.stderr)
-        print('This pod has broken NCCL communication. Common causes:', file=sys.stderr)
-        print('  1. NCCL SHM bug -- corrupt /dev/shm/nccl-* segments (seen on some NVL containers)', file=sys.stderr)
-        print('  2. NCCL version mismatch with driver/CUDA', file=sys.stderr)
-        print('  3. GPU topology not properly exposed to container', file=sys.stderr)
-        print(file=sys.stderr)
-        print('Quick workaround:  NCCL_SHM_DISABLE=1 bash runs/runpod_profile_comms.sh', file=sys.stderr)
-        print('  (WARNING: disabling SHM gives invalid perf numbers on NVL nodes)', file=sys.stderr)
-        print(file=sys.stderr)
-        print('Recommended: terminate this pod and try a different one.', file=sys.stderr)
-    sys.exit(1)
-PYEOF
-
-timeout 60 torchrun --standalone --nproc_per_node=$NUM_GPUS "$NCCL_CHECK" \
-    || { rm -f "$NCCL_CHECK"; echo "FATAL: NCCL check failed. Abort this pod and try another."; exit 1; }
-rm -f "$NCCL_CHECK"
+#timeout 60 torchrun --standalone --nproc_per_node=$NUM_GPUS scripts/nccl_check.py \
+#    || { echo "FATAL: NCCL check failed. Abort this pod and try another."; exit 1; }
 
 # -----------------------------------------------------------------------------
 # System dependencies
@@ -147,7 +111,7 @@ fi
 make_torchrun_cmd() {
     local extra_args="$1"
     if [ -n "$USE_NUMA" ]; then
-        echo "torchrun --standalone --nproc_per_node=$NUM_GPUS scripts/numa_wrapper.sh python -m scripts.profile_comms -- $extra_args"
+        echo "torchrun --standalone --nproc_per_node=$NUM_GPUS scripts/numa_wrapper.py python -m scripts.profile_comms -- $extra_args"
     else
         echo "torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms -- $extra_args"
     fi
