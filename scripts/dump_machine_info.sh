@@ -92,6 +92,46 @@ ip -br addr 2>/dev/null || ifconfig 2>/dev/null || echo "No network tools availa
 divider "INFINIBAND / RDMA"
 ibstat 2>/dev/null || ibv_devinfo 2>/dev/null || echo "No IB tools available"
 
+# ── NETWORK DETAILS ─────────────────────────────
+divider "LINK SPEEDS"
+for iface in $(ls /sys/class/net/ 2>/dev/null); do
+    speed=$(cat /sys/class/net/$iface/speed 2>/dev/null || echo "unknown")
+    operstate=$(cat /sys/class/net/$iface/operstate 2>/dev/null || echo "unknown")
+    echo "$iface: speed=${speed}Mbps state=$operstate"
+done
+
+divider "DEFAULT ROUTE & GATEWAY"
+ip route show default 2>/dev/null || route -n 2>/dev/null || echo "No routing tools available"
+
+divider "DNS CONFIGURATION"
+cat /etc/resolv.conf 2>/dev/null || echo "No resolv.conf found"
+
+divider "DNS LATENCY"
+{ time nslookup google.com 2>/dev/null; } 2>&1 | tail -3 || echo "nslookup not available"
+
+divider "PING LATENCY (google.com)"
+ping -c 5 -W 2 google.com 2>/dev/null | tail -2 || echo "ping not available or blocked"
+
+divider "TCP TUNING PARAMETERS"
+for param in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.core.netdev_max_backlog net.ipv4.tcp_mtu_probing; do
+    val=$(sysctl -n $param 2>/dev/null || echo "unavailable")
+    echo "$param = $val"
+done
+
+divider "INTERNET BANDWIDTH (curl-based)"
+echo "Download test (100MB file from Cloudflare):"
+curl -so /dev/null -w "  speed: %{speed_download} bytes/sec (%{size_download} bytes in %{time_total}s)\n  effective URL: %{url_effective}\n" \
+    --connect-timeout 5 --max-time 30 \
+    https://speed.cloudflare.com/__down?bytes=104857600 2>/dev/null \
+    || echo "Download test failed (curl unavailable or network blocked)"
+
+echo "Upload test (10MB to Cloudflare):"
+dd if=/dev/zero bs=1M count=10 2>/dev/null | \
+    curl -so /dev/null -w "  speed: %{speed_upload} bytes/sec (%{size_upload} bytes in %{time_total}s)\n" \
+    --connect-timeout 5 --max-time 30 \
+    -T - https://speed.cloudflare.com/__up 2>/dev/null \
+    || echo "Upload test failed"
+
 # ── SOFTWARE ─────────────────────────────────────
 divider "PYTHON & TORCH"
 python3 -c "

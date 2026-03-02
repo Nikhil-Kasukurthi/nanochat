@@ -24,7 +24,7 @@ import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, print0, autodetect_device_type, numa_pin
 from nanochat.tokenizer import get_tokenizer
 
 # -----------------------------------------------------------------------------
@@ -48,6 +48,7 @@ args = parser.parse_args()
 device_type = autodetect_device_type()
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0
+numa_pinned, numa_node, numa_cpus = numa_pin(ddp_local_rank)
 
 if not (ddp and device_type == "cuda"):
     print0("Comm profiling requires multi-GPU CUDA. Use: torchrun --nproc_per_node=N")
@@ -296,6 +297,9 @@ if master_process:
             "grad_accum_steps": grad_accum_steps,
             "num_steps_profiled": args.num_steps,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "numa_pinned": numa_pinned,
+            "numa_node": numa_node,
+            "cpu_affinity": sorted(numa_cpus) if numa_cpus else None,
         },
         "measured": {
             "avg_step_ms": round(avg_step, 2),

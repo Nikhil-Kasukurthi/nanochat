@@ -10,7 +10,6 @@ set -e
 # 2) Example launch with nsys tracing:
 # NSYS=1 bash runs/runpod_profile_comms.sh
 
-export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="/workspace/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
@@ -42,6 +41,15 @@ print(f'CUDA OK: {n} device(s) ready')
 # Uses the base image's torchrun + torch (no venv needed).
 
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+
+# OMP / NCCL tuning — set after GPU count is known
+export OMP_NUM_THREADS=$(($(nproc) / NUM_GPUS))
+export OMP_PLACES=cores
+export OMP_PROC_BIND=close
+export NCCL_IB_DISABLE=1        # Vast IB ports are Down; harmless elsewhere
+export NCCL_P2P_LEVEL=NVL       # prefer NVLink for peer-to-peer
+export NCCL_SOCKET_IFNAME=eth0
+
 echo "Checking NCCL communication across $NUM_GPUS GPUs..."
 
 NCCL_CHECK=$(mktemp /tmp/nccl_check_XXXXXX.py)
@@ -85,7 +93,7 @@ rm -f "$NCCL_CHECK"
 # -----------------------------------------------------------------------------
 # System dependencies
 
-apt-get update -qq && apt-get install -y -qq python3-dev vim tmux rsync 2>/dev/null
+apt-get update -qq && apt-get install -y -qq python3-dev vim tmux rsync numactl 2>/dev/null
 
 # Install nsys if not present
 if ! command -v nsys &> /dev/null; then
@@ -115,27 +123,58 @@ python -m nanochat.dataset -n 8
 [ -f "$NANOCHAT_BASE_DIR/tok65536.model" ] || python -m scripts.tok_train
 
 mkdir -p profile_output
+
+# -----------------------------------------------------------------------------
+# NUMA detection — create a per-rank wrapper if multi-socket bare-metal
+#
+# On multi-NUMA machines, numactl --membind ensures memory allocations stay
+# on the socket owning the GPU (the single biggest perf win). The Python-side
+# numa_pin() handles CPU affinity; the shell wrapper handles memory policy.
+
+NUMA_NODES=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)
+USE_NUMA=""
+
+if [ "$NUMA_NODES" -gt 1 ] && command -v numactl &>/dev/null; then
+    export GPUS_PER_NODE=$((NUM_GPUS / NUMA_NODES))
+    echo "NUMA: $NUMA_NODES nodes detected, $GPUS_PER_NODE GPUs per node — enabling numactl wrapper"
+    numactl --hardware 2>/dev/null | head -10
+    USE_NUMA=1
+else
+    echo "NUMA: single node (or numactl not available) — no wrapper needed"
+fi
+
+# Helper: build the torchrun prefix (with or without NUMA wrapper)
+make_torchrun_cmd() {
+    local extra_args="$1"
+    if [ -n "$USE_NUMA" ]; then
+        echo "torchrun --standalone --nproc_per_node=$NUM_GPUS scripts/numa_wrapper.sh python -m scripts.profile_comms -- $extra_args"
+    else
+        echo "torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms -- $extra_args"
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Profile d12 and d26 models on all available GPUs
 # d12 is the smallest standard model; d26 reaches GPT-2 performance
 
 # --- d12 profiling ---
 
-PROFILE_CMD_D12="torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms \
-    -- --depth 12 --num-steps 10 --warmup-steps 3 --device-batch-size 32 --fp8 --output-dir profile_output/d12"
+PROFILE_CMD_D12=$(make_torchrun_cmd "--depth 12 --num-steps 10 --warmup-steps 3 --device-batch-size 32 --fp8 --output-dir profile_output/d12")
 mkdir -p profile_output/d12/nsys_trace
+# nsys sends SIGTERM to children during teardown, producing a non-zero exit.
+# || true prevents set -e from aborting before d26 profiling runs.
 nsys profile \
       --python-backtrace=cuda \
       --pytorch autograd-shapes-nvtx \
       -o profile_output/d12/nsys_trace \
       --trace=cuda,nvtx,osrt \
       --capture-range=cudaProfilerApi \
-      $PROFILE_CMD_D12
+      $PROFILE_CMD_D12 \
+      || true
 
 # --- d26 profiling ---
 
-PROFILE_CMD_D26="torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms \
-    -- --depth 26 --num-steps 10 --warmup-steps 3 --device-batch-size 16 --fp8 --output-dir profile_output/d26"
+PROFILE_CMD_D26=$(make_torchrun_cmd "--depth 26 --num-steps 10 --warmup-steps 3 --device-batch-size 16 --fp8 --output-dir profile_output/d26")
 mkdir -p profile_output/d26/nsys_trace
 nsys profile \
       --python-backtrace=cuda \
@@ -143,4 +182,5 @@ nsys profile \
       -o profile_output/d26/nsys_trace \
       --trace=cuda,nvtx,osrt \
       --capture-range=cudaProfilerApi \
-      $PROFILE_CMD_D26
+      $PROFILE_CMD_D26 \
+      || true

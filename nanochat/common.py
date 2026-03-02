@@ -187,6 +187,68 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
 
     return is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size, device
 
+def _parse_cpulist(cpulist_str):
+    """Parse a Linux cpulist string like '0-31,64-95' into a set of CPU IDs."""
+    cpus = set()
+    for part in cpulist_str.strip().split(','):
+        if '-' in part:
+            lo, hi = part.split('-', 1)
+            cpus.update(range(int(lo), int(hi) + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
+
+def numa_pin(local_rank):
+    """Pin the current process to the NUMA node closest to its GPU.
+
+    On bare-metal multi-socket machines (e.g. 2×Xeon with 8 GPUs split 4+4),
+    this ensures CPU memory allocations and DataLoader workers stay local to
+    the socket owning the GPU, avoiding cross-UPI traffic.
+
+    On single-NUMA or virtualized machines, this is a harmless no-op.
+    All errors are caught and logged — never fatal.
+
+    Returns (pinned: bool, numa_node: int|None, cpu_set: set|None).
+    """
+    node_dir = "/sys/devices/system/node"
+    try:
+        nodes = sorted(
+            int(d.replace("node", ""))
+            for d in os.listdir(node_dir)
+            if d.startswith("node") and d[4:].isdigit()
+        )
+    except (FileNotFoundError, PermissionError):
+        logger.info("NUMA: sysfs not available (macOS / container without sysfs) — skipping")
+        return False, None, None
+
+    if len(nodes) <= 1:
+        logger.info("NUMA: single node detected — no pinning needed")
+        return False, None, None
+
+    num_gpus = torch.cuda.device_count()
+    num_numa = len(nodes)
+    gpus_per_node = num_gpus // num_numa
+    if gpus_per_node == 0:
+        logger.warning(f"NUMA: {num_gpus} GPUs across {num_numa} NUMA nodes — cannot divide evenly, skipping")
+        return False, None, None
+
+    numa_node = nodes[local_rank // gpus_per_node]
+
+    try:
+        cpulist_path = os.path.join(node_dir, f"node{numa_node}", "cpulist")
+        with open(cpulist_path) as f:
+            cpus = _parse_cpulist(f.read())
+        os.sched_setaffinity(0, cpus)
+        if local_rank == 0:
+            logger.info(
+                f"NUMA: {num_numa} nodes, {gpus_per_node} GPUs/node — "
+                f"rank {local_rank} → node {numa_node}, pinned to {len(cpus)} CPUs"
+            )
+        return True, numa_node, cpus
+    except Exception as e:
+        logger.warning(f"NUMA: failed to pin rank {local_rank} to node {numa_node}: {e}")
+        return False, numa_node, None
+
 def compute_cleanup():
     """Companion function to compute_init, to clean things up before script exit"""
     if is_ddp_initialized():
