@@ -89,41 +89,26 @@ python -m nanochat.dataset -n 8
 mkdir -p profile_output
 
 # -----------------------------------------------------------------------------
-# NUMA detection — create a per-rank wrapper if multi-socket bare-metal
-#
-# On multi-NUMA machines, numactl --membind ensures memory allocations stay
-# on the socket owning the GPU (the single biggest perf win). The Python-side
-# numa_pin() handles CPU affinity; the shell wrapper handles memory policy.
+# NUMA diagnostics — log topology for the profiling results
+# Actual NUMA pinning (CPU affinity + memory binding) is handled per-rank
+# inside Python by numa_pin() in nanochat/common.py — no shell wrapper needed.
 
 NUMA_NODES=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)
-USE_NUMA=""
-
-if [ "$NUMA_NODES" -gt 1 ] && command -v numactl &>/dev/null; then
-    export GPUS_PER_NODE=$((NUM_GPUS / NUMA_NODES))
-    echo "NUMA: $NUMA_NODES nodes detected, $GPUS_PER_NODE GPUs per node — enabling numactl wrapper"
-    numactl --hardware 2>/dev/null | head -10
-    USE_NUMA=1
+if [ "$NUMA_NODES" -gt 1 ]; then
+    echo "NUMA: $NUMA_NODES nodes detected — per-rank pinning handled by numa_pin()"
+    numactl --hardware 2>/dev/null | head -10 || true
 else
-    echo "NUMA: single node (or numactl not available) — no wrapper needed"
+    echo "NUMA: single node (or sysfs unavailable) — no pinning needed"
 fi
-
-# Helper: build the torchrun prefix (with or without NUMA wrapper)
-make_torchrun_cmd() {
-    local extra_args="$1"
-    if [ -n "$USE_NUMA" ]; then
-        echo "torchrun --standalone --nproc_per_node=$NUM_GPUS scripts/numa_wrapper.py python -m scripts.profile_comms -- $extra_args"
-    else
-        echo "torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms -- $extra_args"
-    fi
-}
 
 # -----------------------------------------------------------------------------
 # Profile d12 and d26 models on all available GPUs
 # d12 is the smallest standard model; d26 reaches GPT-2 performance
 
+TORCHRUN="torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms --"
+
 # --- d12 profiling ---
 
-PROFILE_CMD_D12=$(make_torchrun_cmd "--depth 12 --num-steps 10 --warmup-steps 3 --device-batch-size 32 --fp8 --output-dir profile_output/d12")
 mkdir -p profile_output/d12/nsys_trace
 # nsys sends SIGTERM to children during teardown, producing a non-zero exit.
 # || true prevents set -e from aborting before d26 profiling runs.
@@ -133,12 +118,11 @@ nsys profile \
       -o profile_output/d12/nsys_trace \
       --trace=cuda,nvtx,osrt \
       --capture-range=cudaProfilerApi \
-      $PROFILE_CMD_D12 \
+      $TORCHRUN --depth 12 --num-steps 10 --warmup-steps 3 --device-batch-size 32 --fp8 --output-dir profile_output/d12 \
       || true
 
 # --- d26 profiling ---
 
-PROFILE_CMD_D26=$(make_torchrun_cmd "--depth 26 --num-steps 10 --warmup-steps 3 --device-batch-size 16 --fp8 --output-dir profile_output/d26")
 mkdir -p profile_output/d26/nsys_trace
 nsys profile \
       --python-backtrace=cuda \
@@ -146,5 +130,5 @@ nsys profile \
       -o profile_output/d26/nsys_trace \
       --trace=cuda,nvtx,osrt \
       --capture-range=cudaProfilerApi \
-      $PROFILE_CMD_D26 \
+      $TORCHRUN --depth 26 --num-steps 10 --warmup-steps 3 --device-batch-size 16 --fp8 --output-dir profile_output/d26 \
       || true

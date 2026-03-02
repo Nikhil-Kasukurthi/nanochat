@@ -198,12 +198,48 @@ def _parse_cpulist(cpulist_str):
             cpus.add(int(part))
     return cpus
 
+def _set_membind(numa_node):
+    """Set MPOL_BIND memory policy for this process via set_mempolicy(2).
+
+    This is the same thing `numactl --membind=N` does. It ensures all future
+    memory allocations (malloc, mmap) land on the specified NUMA node's RAM.
+    Only works on Linux; silently skipped elsewhere.
+    """
+    import ctypes
+    import ctypes.util
+    MPOL_BIND = 2
+    MPOL_F_STATIC_NODES = 1 << 15  # nodemask is absolute, not relative
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        # set_mempolicy(int mode, const unsigned long *nodemask, unsigned long maxnode)
+        nodemask = 1 << numa_node
+        nodemask_arr = (ctypes.c_ulong * 1)(nodemask)
+        maxnode = ctypes.c_ulong(numa_node + 2)  # must be >= highest bit + 1
+        ret = libc.set_mempolicy(
+            ctypes.c_int(MPOL_BIND | MPOL_F_STATIC_NODES),
+            nodemask_arr,
+            maxnode,
+        )
+        if ret != 0:
+            errno = ctypes.get_errno()
+            logger.warning(f"NUMA: set_mempolicy failed with errno {errno}")
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"NUMA: set_mempolicy unavailable: {e}")
+        return False
+
 def numa_pin(local_rank):
     """Pin the current process to the NUMA node closest to its GPU.
 
     On bare-metal multi-socket machines (e.g. 2×Xeon with 8 GPUs split 4+4),
-    this ensures CPU memory allocations and DataLoader workers stay local to
-    the socket owning the GPU, avoiding cross-UPI traffic.
+    this does two things:
+      1. CPU affinity (os.sched_setaffinity) — pins threads to the right socket
+      2. Memory binding (set_mempolicy MPOL_BIND) — forces allocations to local RAM
+
+    The memory binding is the single biggest win: without it, CPU tensors
+    (DataLoader buffers, pinned memory) can land on the remote socket's RAM,
+    causing every H2D transfer to cross UPI.
 
     On single-NUMA or virtualized machines, this is a harmless no-op.
     All errors are caught and logged — never fatal.
@@ -239,10 +275,12 @@ def numa_pin(local_rank):
         with open(cpulist_path) as f:
             cpus = _parse_cpulist(f.read())
         os.sched_setaffinity(0, cpus)
+        membind_ok = _set_membind(numa_node)
         if local_rank == 0:
             logger.info(
                 f"NUMA: {num_numa} nodes, {gpus_per_node} GPUs/node — "
                 f"rank {local_rank} → node {numa_node}, pinned to {len(cpus)} CPUs"
+                f"{', membind active' if membind_ok else ', membind failed (CPU affinity only)'}"
             )
         return True, numa_node, cpus
     except Exception as e:
