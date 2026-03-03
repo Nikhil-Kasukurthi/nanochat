@@ -191,12 +191,60 @@ def _parse_cpulist(cpulist_str):
     """Parse a Linux cpulist string like '0-31,64-95' into a set of CPU IDs."""
     cpus = set()
     for part in cpulist_str.strip().split(','):
+        if not part:
+            continue
         if '-' in part:
             lo, hi = part.split('-', 1)
             cpus.update(range(int(lo), int(hi) + 1))
         else:
             cpus.add(int(part))
     return cpus
+
+def _guess_numa_node_from_rank(local_rank, num_gpus, nodes):
+    """Fallback mapping when PCI/NUMA sysfs lookup is unavailable."""
+    if num_gpus <= 0 or len(nodes) == 0:
+        return None
+    # Scale rank into node index space to avoid out-of-bounds on uneven layouts.
+    node_idx = min((local_rank * len(nodes)) // num_gpus, len(nodes) - 1)
+    return nodes[node_idx]
+
+def _gpu_numa_node(local_rank, nodes):
+    """Best-effort GPU->NUMA mapping using GPU PCI bus ID and sysfs."""
+    num_gpus = torch.cuda.device_count()
+    fallback_node = _guess_numa_node_from_rank(local_rank, num_gpus, nodes)
+    if num_gpus <= 0:
+        return None, False, "no_cuda_devices"
+    if local_rank < 0 or local_rank >= num_gpus:
+        return fallback_node, False, f"invalid_local_rank:{local_rank}"
+    try:
+        props = torch.cuda.get_device_properties(local_rank)
+    except Exception as e:
+        return fallback_node, False, f"props_error:{e}"
+
+    pci_bdf = None
+    if hasattr(props, "pci_bus_id"):
+        raw_bdf = getattr(props, "pci_bus_id")
+        if isinstance(raw_bdf, str) and raw_bdf:
+            pci_bdf = raw_bdf.strip().lower()
+    if pci_bdf is None and all(hasattr(props, a) for a in ("pci_domain_id", "pci_bus_id", "pci_device_id")):
+        pci_bdf = (
+            f"{int(props.pci_domain_id):04x}:"
+            f"{int(props.pci_bus_id):02x}:"
+            f"{int(props.pci_device_id):02x}.0"
+        )
+    if not pci_bdf:
+        return fallback_node, False, "missing_pci_bdf"
+
+    numa_path = os.path.join("/sys/bus/pci/devices", pci_bdf, "numa_node")
+    try:
+        with open(numa_path) as f:
+            numa_node = int(f.read().strip())
+    except Exception as e:
+        return fallback_node, False, f"numa_path_error:{e}"
+
+    if numa_node < 0 or numa_node not in nodes:
+        return fallback_node, False, f"invalid_numa_node:{numa_node}"
+    return numa_node, True, "pci_sysfs"
 
 def _set_membind(numa_node):
     """Set MPOL_BIND memory policy for this process via the set_mempolicy syscall.
@@ -234,7 +282,7 @@ def _set_membind(numa_node):
     except Exception:
         return False
 
-def numa_pin(local_rank):
+def numa_pin(local_rank, return_details=False):
     """Pin the current process to the NUMA node closest to its GPU.
 
     On bare-metal multi-socket machines (e.g. 2×Xeon with 8 GPUs split 4+4),
@@ -250,7 +298,22 @@ def numa_pin(local_rank):
     All errors are caught and logged — never fatal.
 
     Returns (pinned: bool, numa_node: int|None, cpu_set: set|None).
+    If return_details=True, returns (pinned, numa_node, cpu_set, details_dict).
     """
+    details = {
+        "cpu_affinity_ok": False,
+        "membind_ok": False,
+        "mapping_source": "none",
+        "mapping_note": "",
+        "requested_node_cpus": 0,
+        "effective_cpus": 0,
+    }
+
+    def _ret(pinned, node, cpus):
+        if return_details:
+            return pinned, node, cpus, details
+        return pinned, node, cpus
+
     node_dir = "/sys/devices/system/node"
     try:
         nodes = sorted(
@@ -260,37 +323,53 @@ def numa_pin(local_rank):
         )
     except (FileNotFoundError, PermissionError):
         logger.info("NUMA: sysfs not available (macOS / container without sysfs) — skipping")
-        return False, None, None
+        details["mapping_note"] = "node_sysfs_unavailable"
+        return _ret(False, None, None)
 
     if len(nodes) <= 1:
         logger.info("NUMA: single node detected — no pinning needed")
-        return False, None, None
+        details["mapping_note"] = "single_node"
+        return _ret(False, None, None)
 
-    num_gpus = torch.cuda.device_count()
     num_numa = len(nodes)
-    gpus_per_node = num_gpus // num_numa
-    if gpus_per_node == 0:
-        logger.warning(f"NUMA: {num_gpus} GPUs across {num_numa} NUMA nodes — cannot divide evenly, skipping")
-        return False, None, None
-
-    numa_node = nodes[local_rank // gpus_per_node]
+    numa_node, mapping_ok, mapping_note = _gpu_numa_node(local_rank, nodes)
+    details["mapping_source"] = "pci_sysfs" if mapping_ok else "fallback_rank_scaling"
+    details["mapping_note"] = mapping_note
+    if numa_node is None:
+        logger.warning("NUMA: could not determine node for local_rank=%s (note=%s), skipping", local_rank, mapping_note)
+        return _ret(False, None, None)
+    if not mapping_ok:
+        logger.warning("NUMA: rank %s using fallback node mapping (note=%s)", local_rank, mapping_note)
 
     try:
         cpulist_path = os.path.join(node_dir, f"node{numa_node}", "cpulist")
         with open(cpulist_path) as f:
-            cpus = _parse_cpulist(f.read())
+            node_cpus = _parse_cpulist(f.read())
+        allowed_cpus = os.sched_getaffinity(0)
+        cpus = node_cpus & allowed_cpus
+        details["requested_node_cpus"] = len(node_cpus)
+        details["effective_cpus"] = len(cpus)
+        if not cpus:
+            raise RuntimeError(
+                f"empty cpu intersection for node{numa_node} "
+                f"(node={len(node_cpus)} allowed={len(allowed_cpus)})"
+            )
         os.sched_setaffinity(0, cpus)
+        details["cpu_affinity_ok"] = True
         membind_ok = _set_membind(numa_node)
+        details["membind_ok"] = membind_ok
+        pinned = details["cpu_affinity_ok"] and membind_ok
         if local_rank == 0:
             logger.info(
-                f"NUMA: {num_numa} nodes, {gpus_per_node} GPUs/node — "
-                f"rank {local_rank} → node {numa_node}, pinned to {len(cpus)} CPUs"
+                f"NUMA: {num_numa} nodes — rank {local_rank} → node {numa_node} "
+                f"(mapping={details['mapping_source']}:{mapping_note}), "
+                f"cpus {len(cpus)}/{len(node_cpus)}"
                 f"{', membind active' if membind_ok else ', membind failed (CPU affinity only)'}"
             )
-        return True, numa_node, cpus
+        return _ret(pinned, numa_node, cpus)
     except Exception as e:
         logger.warning(f"NUMA: failed to pin rank {local_rank} to node {numa_node}: {e}")
-        return False, numa_node, None
+        return _ret(False, numa_node, None)
 
 def compute_cleanup():
     """Companion function to compute_init, to clean things up before script exit"""

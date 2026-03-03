@@ -95,7 +95,7 @@ mkdir -p profile_output
 
 NUMA_NODES=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)
 if [ "$NUMA_NODES" -gt 1 ]; then
-    echo "NUMA: $NUMA_NODES nodes detected — per-rank pinning handled by numa_pin()"
+    echo "NUMA: $NUMA_NODES nodes detected — torchrun --numa-binding handles CPU affinity, membind set in Python"
     numactl --hardware 2>/dev/null | head -10 || true
 else
     echo "NUMA: single node (or sysfs unavailable) — no pinning needed"
@@ -105,7 +105,7 @@ fi
 # Profile d12 and d26 models on all available GPUs
 # d12 is the smallest standard model; d26 reaches GPT-2 performance
 
-TORCHRUN="torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms --"
+TORCHRUN="torchrun --standalone --nproc_per_node=$NUM_GPUS --numa-binding node -m scripts.profile_comms --"
 
 # --- d12 profiling ---
 

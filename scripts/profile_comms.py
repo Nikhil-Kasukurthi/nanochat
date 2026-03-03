@@ -24,7 +24,7 @@ import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, autodetect_device_type, numa_pin
+from nanochat.common import compute_init, compute_cleanup, print0, autodetect_device_type, _set_membind, _gpu_numa_node
 from nanochat.tokenizer import get_tokenizer
 
 # -----------------------------------------------------------------------------
@@ -48,7 +48,33 @@ args = parser.parse_args()
 device_type = autodetect_device_type()
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0
-numa_pinned, numa_node, numa_cpus = numa_pin(ddp_local_rank)
+# CPU affinity is handled by torchrun --numa-binding.
+# We still need membind (MPOL_BIND) — torchrun doesn't do that.
+try:
+    nodes = sorted(
+        int(d.replace("node", ""))
+        for d in os.listdir("/sys/devices/system/node")
+        if d.startswith("node") and d[4:].isdigit()
+    )
+except (FileNotFoundError, PermissionError):
+    nodes = []
+
+numa_node, mapping_ok, mapping_note = _gpu_numa_node(ddp_local_rank, nodes) if nodes else (None, False, "no_sysfs")
+membind_ok = _set_membind(numa_node) if numa_node is not None else False
+numa_cpus = sorted(os.sched_getaffinity(0))
+
+rank_numa_info = {
+    "rank": ddp_rank,
+    "local_rank": ddp_local_rank,
+    "gpu_index": ddp_local_rank,
+    "numa_node": numa_node,
+    "cpu_affinity_source": "torchrun_numa_binding",
+    "membind_ok": membind_ok,
+    "mapping_source": "pci_sysfs" if mapping_ok else "fallback",
+    "mapping_note": mapping_note,
+    "effective_cpus": len(numa_cpus),
+    "cpu_affinity": numa_cpus,
+}
 
 if not (ddp and device_type == "cuda"):
     print0("Comm profiling requires multi-GPU CUDA. Use: torchrun --nproc_per_node=N")
@@ -282,6 +308,16 @@ print0(f"    Phase 2 (compute+gather): {avg_p2:7.1f} ms ({avg_p2/avg_step*100:.1
 print0(f"    Phase 3 (wait gathers):   {avg_p3:7.1f} ms ({avg_p3/avg_step*100:.1f}%)")
 print0(f"{'='*50}")
 
+# Collect rank-local NUMA status to verify all processes were pinned as expected.
+all_rank_numa_info = None
+if ddp:
+    gathered = [None for _ in range(ddp_world_size)]
+    dist.all_gather_object(gathered, rank_numa_info)
+    if master_process:
+        all_rank_numa_info = sorted(gathered, key=lambda x: x["rank"])
+else:
+    all_rank_numa_info = [rank_numa_info]
+
 # JSON dump
 if master_process:
     os.makedirs(args.output_dir, exist_ok=True)
@@ -297,9 +333,14 @@ if master_process:
             "grad_accum_steps": grad_accum_steps,
             "num_steps_profiled": args.num_steps,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "numa_pinned": numa_pinned,
             "numa_node": numa_node,
-            "cpu_affinity": sorted(numa_cpus) if numa_cpus else None,
+            "numa_cpu_affinity_source": "torchrun_numa_binding",
+            "numa_membind_ok": rank_numa_info["membind_ok"],
+            "numa_mapping_source": rank_numa_info["mapping_source"],
+            "numa_mapping_note": rank_numa_info["mapping_note"],
+            "numa_effective_cpus": rank_numa_info["effective_cpus"],
+            "cpu_affinity": numa_cpus,
+            "rank_numa": all_rank_numa_info,
         },
         "measured": {
             "avg_step_ms": round(avg_step, 2),
