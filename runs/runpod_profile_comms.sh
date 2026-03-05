@@ -94,12 +94,54 @@ mkdir -p profile_output
 # inside Python by numa_pin() in nanochat/common.py — no shell wrapper needed.
 
 NUMA_NODES=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)
+echo "============================================================"
+echo "  NUMA & GPU TOPOLOGY DIAGNOSTICS"
+echo "============================================================"
+echo ""
+echo "--- NUMA hardware ---"
 if [ "$NUMA_NODES" -gt 1 ]; then
-    echo "NUMA: $NUMA_NODES nodes detected — torchrun --numa-binding handles CPU affinity, membind set in Python"
-    numactl --hardware 2>/dev/null | head -10 || true
+    echo "NUMA: $NUMA_NODES nodes detected"
+    echo "  CPU affinity: torchrun --numa-binding"
+    echo "  Memory binding: set_membind() in Python"
+    echo ""
+    numactl --hardware 2>/dev/null || echo "  numactl not available"
 else
     echo "NUMA: single node (or sysfs unavailable) — no pinning needed"
 fi
+
+echo ""
+echo "--- NUMA node ↔ CPU mapping ---"
+for node_dir in /sys/devices/system/node/node[0-9]*; do
+    node=$(basename "$node_dir")
+    cpulist=$(cat "$node_dir/cpulist" 2>/dev/null || echo "unknown")
+    meminfo_total=$(awk '/MemTotal/ {printf "%.1f GB", $4/1048576}' "$node_dir/meminfo" 2>/dev/null || echo "unknown")
+    echo "  $node: CPUs [$cpulist]  Memory: $meminfo_total"
+done
+
+echo ""
+echo "--- GPU topology (nvidia-smi topo -m) ---"
+nvidia-smi topo -m 2>/dev/null || echo "  nvidia-smi topo not available"
+
+echo ""
+echo "--- GPU ↔ NUMA node mapping (PCI sysfs) ---"
+for gpu_idx in $(seq 0 $((NUM_GPUS - 1))); do
+    pci_bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "$gpu_idx" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    if [ -n "$pci_bus" ]; then
+        # Strip domain prefix (0000:) for sysfs lookup
+        pci_short=$(echo "$pci_bus" | sed 's/^0000://')
+        numa_node=$(cat "/sys/bus/pci/devices/$pci_short/numa_node" 2>/dev/null \
+                 || cat "/sys/bus/pci/devices/$pci_bus/numa_node" 2>/dev/null \
+                 || echo "unknown")
+        gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$gpu_idx" 2>/dev/null)
+        echo "  GPU $gpu_idx ($gpu_name): PCI $pci_bus → NUMA node $numa_node"
+    fi
+done
+
+echo ""
+echo "--- NVLink status ---"
+nvidia-smi nvlink --status 2>/dev/null || echo "  NVLink query not supported"
+echo "============================================================"
+echo ""
 
 # -----------------------------------------------------------------------------
 # Profile d12 and d26 models on all available GPUs
