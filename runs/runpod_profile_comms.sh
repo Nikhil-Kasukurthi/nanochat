@@ -54,41 +54,7 @@ echo "Checking NCCL communication across $NUM_GPUS GPUs..."
 #timeout 60 torchrun --standalone --nproc_per_node=$NUM_GPUS scripts/nccl_check.py \
 #    || { echo "FATAL: NCCL check failed. Abort this pod and try another."; exit 1; }
 
-# -----------------------------------------------------------------------------
-# System dependencies
-
-apt-get update -qq && apt-get install -y -qq python3-dev vim tmux rsync numactl 2>/dev/null
-
-# Install nsys if not present
-if ! command -v nsys &> /dev/null; then
-    apt-get install -y -qq nsight-systems-cli 2>/dev/null || {
-        apt-get install -y --no-install-recommends gnupg 2>/dev/null
-        echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" \
-            | tee /etc/apt/sources.list.d/nvidia-devtools.list
-        apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub 2>/dev/null
-        apt-get update -qq && apt-get install -y -qq nsight-systems-cli
-    }
-fi
-
-# -----------------------------------------------------------------------------
-# Python venv setup with uv
-
-command -v uv &> /dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh && source $HOME/.local/bin/env; }
-export PATH="$HOME/.local/bin:$PATH"
-[ -d ".venv" ] || uv venv
-uv sync --extra gpu
-source .venv/bin/activate
-
-# -----------------------------------------------------------------------------
-# Data + tokenizer (profiling only needs a few shards)
-
-python -m nanochat.dataset -n 8
-# train tokenizer if not already present
-[ -f "$NANOCHAT_BASE_DIR/tok65536.model" ] || python -m scripts.tok_train
-
-mkdir -p profile_output
-
-# -----------------------------------------------------------------------------
+ -----------------------------------------------------------------------------
 # NUMA diagnostics — log topology for the profiling results
 # Actual NUMA pinning (CPU affinity + memory binding) is handled per-rank
 # inside Python by numa_pin() in nanochat/common.py — no shell wrapper needed.
@@ -148,6 +114,41 @@ echo ""
 # d12 is the smallest standard model; d26 reaches GPT-2 performance
 
 TORCHRUN="torchrun --standalone --nproc_per_node=$NUM_GPUS --numa-binding node -m scripts.profile_comms --"
+
+
+# -----------------------------------------------------------------------------
+# System dependencies
+
+apt-get update -qq && apt-get install -y -qq python3-dev vim tmux rsync numactl 2>/dev/null
+
+# Install nsys if not present
+if ! command -v nsys &> /dev/null; then
+    apt-get install -y -qq nsight-systems-cli 2>/dev/null || {
+        apt-get install -y --no-install-recommends gnupg 2>/dev/null
+        echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" \
+            | tee /etc/apt/sources.list.d/nvidia-devtools.list
+        apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub 2>/dev/null
+        apt-get update -qq && apt-get install -y -qq nsight-systems-cli
+    }
+fi
+
+# -----------------------------------------------------------------------------
+# Python venv setup with uv
+
+command -v uv &> /dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh && source $HOME/.local/bin/env; }
+export PATH="$HOME/.local/bin:$PATH"
+[ -d ".venv" ] || uv venv
+uv sync --extra gpu
+source .venv/bin/activate
+
+# -----------------------------------------------------------------------------
+# Data + tokenizer (profiling only needs a few shards)
+
+python -m nanochat.dataset -n 8
+# train tokenizer if not already present
+[ -f "$NANOCHAT_BASE_DIR/tok65536.model" ] || python -m scripts.tok_train
+
+mkdir -p profile_output
 
 # --- d12 profiling ---
 
