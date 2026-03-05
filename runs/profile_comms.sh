@@ -10,7 +10,6 @@ set -e
 # 2) Example launch with nsys tracing:
 # NSYS=1 bash runs/runpod_profile_comms.sh
 
-export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="/workspace/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
@@ -42,50 +41,81 @@ print(f'CUDA OK: {n} device(s) ready')
 # Uses the base image's torchrun + torch (no venv needed).
 
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+
+# OMP / NCCL tuning — set after GPU count is known
+export OMP_NUM_THREADS=$(($(nproc) / NUM_GPUS))
+export OMP_PLACES=cores
+export OMP_PROC_BIND=close
+export NCCL_IB_DISABLE=1        # Vast IB ports are Down; harmless elsewhere
+export NCCL_P2P_LEVEL=NVL       # prefer NVLink for peer-to-peer
+export NCCL_SOCKET_IFNAME=eth0
+
 echo "Checking NCCL communication across $NUM_GPUS GPUs..."
+timeout 60 torchrun --standalone --nproc_per_node=$NUM_GPUS scripts/nccl_check.py \
+#    || { echo "FATAL: NCCL check failed. Abort this pod and try another."; exit 1; }
 
-NCCL_CHECK=$(mktemp /tmp/nccl_check_XXXXXX.py)
-cat > "$NCCL_CHECK" << 'PYEOF'
-import torch, torch.distributed as dist, os, sys
-rank = int(os.environ['LOCAL_RANK'])
-torch.cuda.set_device(rank)
-device = torch.device('cuda', rank)
-try:
-    dist.init_process_group(backend='nccl', device_id=device)
-    dist.barrier()
-    t = torch.ones(1024, device=device) * (rank + 1)
-    dist.all_reduce(t)
-    expected = sum(range(1, dist.get_world_size() + 1)) * 1024
-    assert abs(t.sum().item() - expected) < 1e-3, f'all_reduce mismatch: {t.sum().item()} != {expected}'
-    if rank == 0:
-        gpu_name = torch.cuda.get_device_name(0)
-        nccl_ver = '.'.join(str(x) for x in torch.cuda.nccl.version())
-        print(f'NCCL OK: {dist.get_world_size()} GPUs communicating ({gpu_name}, NCCL {nccl_ver})')
-    dist.destroy_process_group()
-except Exception as e:
-    if rank == 0:
-        print(f'\nNCCL HEALTH CHECK FAILED: {e}', file=sys.stderr)
-        print(file=sys.stderr)
-        print('This pod has broken NCCL communication. Common causes:', file=sys.stderr)
-        print('  1. NCCL SHM bug -- corrupt /dev/shm/nccl-* segments (seen on some NVL containers)', file=sys.stderr)
-        print('  2. NCCL version mismatch with driver/CUDA', file=sys.stderr)
-        print('  3. GPU topology not properly exposed to container', file=sys.stderr)
-        print(file=sys.stderr)
-        print('Quick workaround:  NCCL_SHM_DISABLE=1 bash runs/runpod_profile_comms.sh', file=sys.stderr)
-        print('  (WARNING: disabling SHM gives invalid perf numbers on NVL nodes)', file=sys.stderr)
-        print(file=sys.stderr)
-        print('Recommended: terminate this pod and try a different one.', file=sys.stderr)
-    sys.exit(1)
-PYEOF
+# NUMA diagnostics — log topology for the profiling results
+# Actual NUMA pinning (CPU affinity + memory binding) is handled per-rank
+# inside Python by numa_pin() in nanochat/common.py — no shell wrapper needed.
 
-timeout 60 torchrun --standalone --nproc_per_node=$NUM_GPUS "$NCCL_CHECK" \
-    || { rm -f "$NCCL_CHECK"; echo "FATAL: NCCL check failed. Abort this pod and try another."; exit 1; }
-rm -f "$NCCL_CHECK"
+NUMA_NODES=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)
+echo "============================================================"
+echo "  NUMA & GPU TOPOLOGY DIAGNOSTICS"
+echo "============================================================"
+echo ""
+echo "--- NUMA hardware ---"
+if [ "$NUMA_NODES" -gt 1 ]; then
+    echo "NUMA: $NUMA_NODES nodes detected"
+    echo "  CPU affinity: torchrun --numa-binding"
+    echo "  Memory binding: set_membind() in Python"
+    echo ""
+    numactl --hardware 2>/dev/null || echo "  numactl not available"
+else
+    echo "NUMA: single node (or sysfs unavailable) — no pinning needed"
+fi
+
+echo ""
+echo "--- NUMA node ↔ CPU mapping ---"
+for node_dir in /sys/devices/system/node/node[0-9]*; do
+    node=$(basename "$node_dir")
+    cpulist=$(cat "$node_dir/cpulist" 2>/dev/null || echo "unknown")
+    meminfo_total=$(awk '/MemTotal/ {printf "%.1f GB", $4/1048576}' "$node_dir/meminfo" 2>/dev/null || echo "unknown")
+    echo "  $node: CPUs [$cpulist]  Memory: $meminfo_total"
+done
+
+echo ""
+echo "--- GPU topology (nvidia-smi topo -m) ---"
+nvidia-smi topo -m 2>/dev/null || echo "  nvidia-smi topo not available"
+
+echo ""
+echo "--- GPU ↔ NUMA node mapping (PCI sysfs) ---"
+for gpu_idx in $(seq 0 $((NUM_GPUS - 1))); do
+    pci_bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "$gpu_idx" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    if [ -n "$pci_bus" ]; then
+        # Strip domain prefix (0000:) for sysfs lookup
+        pci_short=$(echo "$pci_bus" | sed 's/^0000://')
+        numa_node=$(cat "/sys/bus/pci/devices/$pci_short/numa_node" 2>/dev/null \
+                 || cat "/sys/bus/pci/devices/$pci_bus/numa_node" 2>/dev/null \
+                 || echo "unknown")
+        gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$gpu_idx" 2>/dev/null)
+        echo "  GPU $gpu_idx ($gpu_name): PCI $pci_bus → NUMA node $numa_node"
+    fi
+done
+
+echo ""
+echo "--- NVLink status ---"
+nvidia-smi nvlink --status 2>/dev/null || echo "  NVLink query not supported"
+echo "============================================================"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Profile d12 and d26 models on all available GPUs
+# d12 is the smallest standard model; d26 reaches GPT-2 performance
 
 # -----------------------------------------------------------------------------
 # System dependencies
 
-apt-get update -qq && apt-get install -y -qq python3-dev vim tmux rsync 2>/dev/null
+apt-get update -qq && apt-get install -y -qq python3-dev vim tmux rsync numactl 2>/dev/null
 
 # Install nsys if not present
 if ! command -v nsys &> /dev/null; then
@@ -115,27 +145,24 @@ python -m nanochat.dataset -n 8
 [ -f "$NANOCHAT_BASE_DIR/tok65536.model" ] || python -m scripts.tok_train
 
 mkdir -p profile_output
-# -----------------------------------------------------------------------------
-# Profile d12 and d26 models on all available GPUs
-# d12 is the smallest standard model; d26 reaches GPT-2 performance
 
 # --- d12 profiling ---
 
-PROFILE_CMD_D12="torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms \
-    -- --depth 12 --num-steps 10 --warmup-steps 3 --device-batch-size 32 --fp8 --output-dir profile_output/d12"
 mkdir -p profile_output/d12/nsys_trace
+# nsys sends SIGTERM to children during teardown, producing a non-zero exit.
+# || true prevents set -e from aborting before d26 profiling runs.
+export TORCHRUN="torchrun --standalone --nproc_per_node=$NUM_GPUS --numa-binding node -m scripts.profile_comms --"
 nsys profile \
       --python-backtrace=cuda \
       --pytorch autograd-shapes-nvtx \
       -o profile_output/d12/nsys_trace \
       --trace=cuda,nvtx,osrt \
       --capture-range=cudaProfilerApi \
-      $PROFILE_CMD_D12
+      $TORCHRUN --depth 12 --num-steps 10 --warmup-steps 3 --device-batch-size 32 --fp8 --output-dir profile_output/d12 \
+      || true
 
 # --- d26 profiling ---
 
-PROFILE_CMD_D26="torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms \
-    -- --depth 26 --num-steps 10 --warmup-steps 3 --device-batch-size 16 --fp8 --output-dir profile_output/d26"
 mkdir -p profile_output/d26/nsys_trace
 nsys profile \
       --python-backtrace=cuda \
@@ -143,4 +170,5 @@ nsys profile \
       -o profile_output/d26/nsys_trace \
       --trace=cuda,nvtx,osrt \
       --capture-range=cudaProfilerApi \
-      $PROFILE_CMD_D26
+      $TORCHRUN --depth 26 --num-steps 10 --warmup-steps 3 --device-batch-size 16 --fp8 --output-dir profile_output/d26 \
+      || true
