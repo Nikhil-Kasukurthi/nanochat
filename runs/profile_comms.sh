@@ -51,10 +51,9 @@ export NCCL_P2P_LEVEL=NVL       # prefer NVLink for peer-to-peer
 export NCCL_SOCKET_IFNAME=eth0
 
 echo "Checking NCCL communication across $NUM_GPUS GPUs..."
-#timeout 60 torchrun --standalone --nproc_per_node=$NUM_GPUS scripts/nccl_check.py \
+timeout 60 torchrun --standalone --nproc_per_node=$NUM_GPUS scripts/nccl_check.py \
 #    || { echo "FATAL: NCCL check failed. Abort this pod and try another."; exit 1; }
 
- -----------------------------------------------------------------------------
 # NUMA diagnostics — log topology for the profiling results
 # Actual NUMA pinning (CPU affinity + memory binding) is handled per-rank
 # inside Python by numa_pin() in nanochat/common.py — no shell wrapper needed.
