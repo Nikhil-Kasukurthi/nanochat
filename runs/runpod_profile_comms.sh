@@ -113,9 +113,6 @@ echo ""
 # Profile d12 and d26 models on all available GPUs
 # d12 is the smallest standard model; d26 reaches GPT-2 performance
 
-TORCHRUN="torchrun --standalone --nproc_per_node=$NUM_GPUS --numa-binding node -m scripts.profile_comms --"
-
-
 # -----------------------------------------------------------------------------
 # System dependencies
 
