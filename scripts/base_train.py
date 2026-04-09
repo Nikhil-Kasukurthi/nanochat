@@ -46,6 +46,7 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+parser.add_argument("--fp4", action="store_true", help="enable FP4 training (requires Blackwell SM100+ GPU)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -78,6 +79,8 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+if args.fp8 and args.fp4:
+    parser.error("--fp8 and --fp4 are mutually exclusive (both replace nn.Linear)")
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -165,17 +168,20 @@ if resuming:
 # FP8 training initialization and management (this has to be done before torch.compile)
 
 # Convert Linear layers to Float8Linear if --fp8 is set
-if args.fp8:
+if args.fp8 or args.fp4:
     if device_type != "cuda":
-        print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
+        print0("Warning: FP8/FP4 training requires CUDA, ignoring --fp8 flag")
     else:
         # our custom fp8 is simpler than torchao, written for exact API compatibility
-        from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
+        if args.fp8:
+            from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
+        if args.fp4:
+            from nanochat.fp4 import convert_to_float4_training
         # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
         import torch.nn as nn
 
         # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
-        def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
+        def quantize_module_filter(mod: nn.Module, fqn: str) -> bool:
             if not isinstance(mod, nn.Linear):
                 return False
             if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
@@ -184,27 +190,36 @@ if args.fp8:
                 return False
             return True
 
-        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
-        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
-        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
-        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-        num_skipped = num_linear - num_fp8
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
 
-# Context manager to temporarily disable FP8 so that model evaluation remains in BF16
+        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
+        if args.fp8:
+            fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
+            convert_to_float8_training(model, config=fp8_config, module_filter_fn=quantize_module_filter)
+            num_quant = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
+        elif args.fp4:
+            convert_to_float4_training(model, module_filter_fn=quantize_module_filter)
+            num_quant = sum(1 for m in model.modules() if 'Float4' in type(m).__name__)
+
+
+        num_skipped = num_linear - num_quant
+
+        quant_label = f"FP8 ({args.fp8_recipe} scaling)" if args.fp8 else "FP4 (blockwise scaling)"
+        print0(f"✓ {quant_label} training enabled - converted {num_quant}/{num_linear} linear layers, skipped {num_skipped} (too small)")
+
+# Context manager to temporarily disable FP8/FP4 so that model evaluation remains in BF16
 @contextmanager
 def disable_fp8(model):
-    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation.
+    """Temporarily swap Float8Linear/Float4Linear modules with nn.Linear for BF16 evaluation.
 
     CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
-    we swap out Float8Linear modules entirely and restore them after.
+    we swap out quantized modules entirely and restore them after.
     """
     import torch.nn as nn
 
-    # Find all Float8Linear modules and their locations
-    fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
+    # Find all Float8Linear/Float4Linear modules and their locations
+    fp8_locations = []  # list of (parent_module, attr_name, quantized_module)
     for name, module in model.named_modules():
-        if 'Float8' in type(module).__name__:
+        if 'Float8' in type(module).__name__ or 'Float4' in type(module).__name__:
             if '.' in name:
                 parent_name, attr_name = name.rsplit('.', 1)
                 parent = model.get_submodule(parent_name)
