@@ -1,38 +1,28 @@
-"""Minimal NVFP4 training for nanochat — block-wise dynamic scaling.
+"""Minimal NVFP4 training for nanochat — block-wise scaling.
 
 Drop-in replacement for Float8Linear using 4-bit floating point (NVFP4).
 Requires Blackwell (SM100+) GPUs — float4_e2m1fn_x2 is not supported on H100.
 
-How NVFP4 differs from FP8
-===========================
-FP8 uses tensorwise scaling: one FP32 scalar per tensor. This works because FP8
-has enough range (e4m3: 8 values per exponent) to represent most distributions.
-
+How NVFP4 works
+================
 FP4 has only 1 mantissa bit (e2m1: representable values are {0, 0.5, 1, 1.5, 2,
-3, 4, 6}). With just one global scale, outliers would destroy precision for all
-other values. So NVFP4 uses two-level "double quantization":
-
-  Level 1 (block scales): One FP8 e4m3 scale per block of 16 elements.
-    Each block tracks its own dynamic range independently.
-
-  Level 2 (per-tensor scale): One FP32 scalar normalizes all block scales
-    so they use FP8's full range. Without this, block scales for blocks with
-    small values would underflow in FP8.
+3, 4, 6}). One global scale would destroy precision, so NVFP4 uses block-wise
+scaling: one FP8 e4m3 scale per block of 16 elements.
 
 The matmul path is:
   1. Quantize input/weight to FP4 with block-wise FP8 scales
   2. torch._scaled_mm with FP4 data + block scales (cuBLAS Blackwell kernel)
-  3. Multiply output by (per_tensor_scale_a * per_tensor_scale_b)
 
 Backward pass uses fake quantization: dequantize to bf16 for gradient matmuls.
-This avoids compounding quantization error through the backward pass.
 
-torch._scaled_mm for FP4
-=========================
-Same function as FP8, but:
-  - Data args use torch.float4_e2m1fn_x2 (two FP4 values packed per byte)
-  - Scale args are block-wise FP8 tensors (shape: M x K//16), not scalars
-  - Scales must be in "swizzled" (blocked) memory layout for cuBLAS
+float4_e2m1fn_x2 is a view-only dtype
+=======================================
+PyTorch's float4_e2m1fn_x2 is a "shell dtype" — you cannot cast into it via
+.to(). Instead, data must be manually encoded as uint8 (two FP4 nibbles per
+byte) and reinterpreted via .view(torch.float4_e2m1fn_x2) only at the
+_scaled_mm call boundary. This matches torchao's approach.
+
+Reference: pytorch/ao torchao/prototype/mx_formats/nvfp4_tensor.py
 """
 
 import torch
@@ -45,93 +35,115 @@ FP4_E2M1_MAX = 6.0  # max representable value in float4 e2m1
 FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 EPS = 1e-12
 
+# FP4 e2m1 representable absolute values (8 levels) and their 4-bit codes
+# Code 0=0, 1=0.5, 2=1.0, 3=1.5, 4=2.0, 5=3.0, 6=4.0, 7=6.0
+# Sign bit is bit 3 (0=positive, 1=negative)
+_FP4_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+# Boundaries for round-to-nearest between consecutive values
+_FP4_BOUNDARIES = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
 
-@torch.no_grad()
-def _to_nvfp4(x):
-    """Quantize a 2D tensor to NVFP4 using block-wise double scaling.
+
+def _f32_to_fp4_packed(x_flat):
+    """Convert a flat float tensor to packed FP4 e2m1 uint8 (two values per byte).
 
     Args:
-        x: Input tensor of shape (M, K) where K must be divisible by BLOCK_SIZE (16).
+        x_flat: 1D float tensor with an even number of elements, values should
+                already be in [-FP4_E2M1_MAX, FP4_E2M1_MAX].
 
     Returns:
-        (fp4_data, block_scales_fp8, per_tensor_scale) where:
-        - fp4_data: shape (M, K) in torch.float4_e2m1fn_x2 (packed, K//2 bytes per row)
-        - block_scales_fp8: shape (M, K//16) in torch.float8_e4m3fn
-        - per_tensor_scale: scalar FP32 tensor
-
-    TODO(human): Implement the two-level quantization:
-
-    Step 1 — Per-tensor scale (Level 2, computed first):
-      tensor_amax = max(|x|) over all elements
-      per_tensor_scale = tensor_amax / (FP8_E4M3_MAX * FP4_E2M1_MAX)
-      This ensures block scales will fit in FP8 range.
-
-    Step 2 — Block scales (Level 1):
-      Reshape x to (M, K//16, 16) blocks
-      block_amax = max(|x|) within each block → shape (M, K//16)
-      block_scale = block_amax / per_tensor_scale
-      Clamp block_scale to [EPS, FP8_E4M3_MAX] and cast to float8_e4m3fn
-
-    Step 3 — Quantize data:
-      Compute effective_scale = per_tensor_scale * block_scale_fp8 (broadcast over block)
-      x_scaled = x / effective_scale
-      Clamp to [-FP4_E2M1_MAX, FP4_E2M1_MAX]
-      Cast to torch.float4_e2m1fn_x2
-
-    Hints:
-      - Use .unsqueeze(-1) to broadcast block scales over the 16-element blocks
-      - per_tensor_scale should stay in float32 (it's applied after the matmul)
-      - block_scale_fp8 must be float8_e4m3fn (cuBLAS reads it as FP8)
-      - The final cast to float4_e2m1fn_x2 packs two FP4 values per byte
+        uint8 tensor with half the elements (two FP4 values packed per byte).
+        First value in bits 0-3, second value in bits 4-7.
     """
-    M, K = x.shape
-    assert K % BLOCK_SIZE == 0, f"K={K} must be divisible by BLOCK_SIZE={BLOCK_SIZE}"
+    boundaries = _FP4_BOUNDARIES.to(x_flat.device)
+    sign = (x_flat < 0).to(torch.uint8)
+    # Map absolute values to nearest FP4 code (0-7) via bucket boundaries
+    code = torch.bucketize(x_flat.abs(), boundaries).to(torch.uint8)
+    # Combine sign (bit 3) with magnitude code (bits 0-2)
+    nibble = code | (sign << 3)
+    # Pack pairs: first value in low nibble, second in high nibble
+    return (nibble[0::2] & 0xF) | ((nibble[1::2] & 0xF) << 4)
 
-    # maximum value over entire tensor
-    vmax = x.float().abs().max()
-    per_tensor_scale = vmax / (FP8_E4M3_MAX * FP4_E2M1_MAX)
-    per_tensor_scale = per_tensor_scale.float()
 
-    # The 16 requirement is due to FP4 Tensorcores reading memory in this format on sm_120 (blackwell) devices
-    x = x.reshape(M, K//16, 16)
+def _fp4_packed_to_f32(packed, device):
+    """Unpack FP4 uint8 data back to float32.
 
-    # max on dim returns values, indices
-    block_vmax = x.float().abs().max(dim=-1).values / per_tensor_scale
-    block_vmax = block_vmax.clamp(min=EPS, max=FP8_E4M3_MAX)
-    block_scales_fp8 = block_vmax.to(torch.float8_e4m3fn)
+    Args:
+        packed: uint8 tensor with two FP4 values per byte.
+        device: target device for the lookup table.
 
-    scale = (per_tensor_scale * block_scales_fp8.to(x.dtype)).unsqueeze(-1)
-    x_scaled = x / scale
-    x_scaled  = x_scaled.clamp(min=-FP4_E2M1_MAX, max=FP4_E2M1_MAX)
-    x_fp4 = x_scaled.to(torch.float4_e2m1fn_x2)
-    x_fp4 = x_fp4.reshape(M, K)
-
-    return x_fp4, block_scales_fp8, per_tensor_scale.float()
+    Returns:
+        float32 tensor with twice the elements.
+    """
+    fp4_values = _FP4_VALUES.to(device)
+    # Extract low and high nibbles
+    lo = packed & 0x0F
+    hi = (packed >> 4) & 0x0F
+    # Separate sign (bit 3) and magnitude (bits 0-2)
+    lo_sign = ((lo >> 3) & 1).to(torch.float32) * -2.0 + 1.0  # 1.0 or -1.0
+    hi_sign = ((hi >> 3) & 1).to(torch.float32) * -2.0 + 1.0
+    lo_mag = fp4_values[(lo & 0x07).long()]
+    hi_mag = fp4_values[(hi & 0x07).long()]
+    # Interleave back: [lo0, hi0, lo1, hi1, ...]
+    result = torch.stack([lo_sign * lo_mag, hi_sign * hi_mag], dim=-1)
+    return result.view(-1)
 
 
 def _ceil_div(a, b):
     return (a + b - 1) // b
 
 
+@torch.no_grad()
+def _to_nvfp4(x):
+    """Quantize a 2D tensor to NVFP4 using block-wise scaling.
+
+    Following torchao's single-level approach:
+      block_scale = max(|block|) / FP4_E2M1_MAX, clamped to FP8 range.
+
+    Args:
+        x: Input tensor of shape (M, K) where K must be divisible by BLOCK_SIZE (16).
+
+    Returns:
+        (fp4_packed, block_scales_fp8) where:
+        - fp4_packed: shape (M, K//2) in uint8 (two FP4 values per byte)
+        - block_scales_fp8: shape (M, K//16) in float8_e4m3fn
+    """
+    M, K = x.shape
+    assert K % BLOCK_SIZE == 0, f"K={K} must be divisible by BLOCK_SIZE={BLOCK_SIZE}"
+
+    # Reshape into blocks of 16
+    x_blocks = x.float().reshape(M, K // BLOCK_SIZE, BLOCK_SIZE)
+
+    # Block scales: one FP8 scale per block
+    block_amax = x_blocks.abs().amax(dim=-1)  # (M, K//16)
+    block_scale = block_amax / FP4_E2M1_MAX
+    block_scale = block_scale.clamp(min=EPS, max=FP8_E4M3_MAX)
+    block_scales_fp8 = block_scale.to(torch.float8_e4m3fn)
+
+    # Scale data into FP4 range using the FP8-rounded scales
+    block_scale_f32 = block_scales_fp8.to(torch.float32)
+    x_scaled = x_blocks / block_scale_f32.unsqueeze(-1)
+    x_scaled = x_scaled.clamp(-FP4_E2M1_MAX, FP4_E2M1_MAX)
+
+    # Encode to packed uint8 (two FP4 values per byte)
+    x_flat = x_scaled.reshape(-1)
+    fp4_packed = _f32_to_fp4_packed(x_flat)
+    fp4_packed = fp4_packed.reshape(M, K // 2)
+
+    return fp4_packed, block_scales_fp8
+
+
 def _to_blocked_scales(scales, M, num_blocks):
     """Rearrange block scales into the swizzled (blocked) layout cuBLAS expects.
 
-    cuBLAS NVFP4 kernels don't read scales in simple row-major order. They
-    expect a specific blocked layout that matches how the kernel tiles the
-    matmul. This is an implementation detail of NVIDIA's cuBLAS — the exact
-    layout may change between CUDA versions.
+    cuBLAS NVFP4 kernels read scales in a specific tiled order. This function
+    rearranges (M, num_blocks) scales into that layout.
 
-    float4_e2m1fn_x2 packs two FP4 values per byte, so cuBLAS sees the K
-    dimension as K_packed = K // 2. Block scales are computed per 16 logical
-    elements, but cuBLAS expects them per 16 packed elements (= 32 logical),
-    so each block scale must be duplicated to cover both packed halves.
+    The packed FP4 format (float4_e2m1fn_x2) halves the K dimension, so cuBLAS
+    sees K_packed = K//2. It expects scales for K_packed/16 = K/32 blocks, but
+    we computed K/16 blocks. Each scale must be duplicated to cover both halves
+    of a packed block.
 
-    The swizzled layout reorganizes (M, num_k_blocks) into tiles of
-    (128, 4) that are permuted into (32, 16) sub-tiles for cuBLAS's
-    tiling pattern.
-
-    Reference: torch/_meta_registrations.py:meta_scaled_mm (NVFP4 branch)
-    and torchao.prototype.mx_formats.utils.to_blocked()
+    Reference: torchao.prototype.mx_formats.utils.to_blocked()
 
     Args:
         scales: block scales of shape (M, num_blocks) in float8_e4m3fn
@@ -141,48 +153,48 @@ def _to_blocked_scales(scales, M, num_blocks):
     Returns:
         Scales in swizzled blocked layout, flattened to 1D.
     """
-    BLOCK_MN = 128
-    BLOCK_K = 16  # cuBLAS block size for scales (in packed elements)
-
-    # Duplicate each scale for the two packed halves (16 logical -> 2x 16 packed)
+    # Duplicate each scale for the two packed halves
     scales_expanded = scales.repeat_interleave(2, dim=1)  # (M, num_blocks*2)
-    num_k_blocks = scales_expanded.shape[1]
+    rows, cols = scales_expanded.shape
 
-    # Pad to multiples of (BLOCK_MN, 4) as cuBLAS requires
-    n_row_blocks = _ceil_div(M, BLOCK_MN)
-    n_col_blocks = _ceil_div(num_k_blocks, 4)
-    padded_rows = n_row_blocks * BLOCK_MN
+    # Pad to multiples of (128, 4) as cuBLAS requires
+    n_row_blocks = _ceil_div(rows, 128)
+    n_col_blocks = _ceil_div(cols, 4)
+    padded_rows = n_row_blocks * 128
     padded_cols = n_col_blocks * 4
 
-    padded = torch.zeros(padded_rows, padded_cols, dtype=scales.dtype, device=scales.device)
-    padded[:M, :num_k_blocks] = scales_expanded
+    padded = scales_expanded
+    if (rows, cols) != (padded_rows, padded_cols):
+        padded = torch.zeros(padded_rows, padded_cols,
+                             dtype=scales.dtype, device=scales.device)
+        padded[:rows, :cols] = scales_expanded
 
     # Swizzle: rearrange (128, 4) tiles into (32, 16) sub-tiles
-    blocks = padded.view(n_row_blocks, BLOCK_MN, n_col_blocks, 4)
-    blocks = blocks.permute(0, 2, 1, 3)  # (n_row, n_col, 128, 4)
-    blocks = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, BLOCK_K)
-
-    return blocks.flatten().contiguous()
+    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
+    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
+    return rearranged.flatten()
 
 
 @torch.no_grad()
-def _dequantize_nvfp4(fp4_data, block_scales_fp8, per_tensor_scale, orig_dtype):
+def _dequantize_nvfp4(fp4_packed, block_scales_fp8, orig_dtype):
     """Dequantize NVFP4 back to high precision for backward pass.
 
-    Reverses the quantization: data * block_scale * per_tensor_scale
+    Reverses the quantization: unpack FP4 → float, then multiply by block scales.
     """
-    M = fp4_data.shape[0]
-    K = fp4_data.shape[1]  # logical K (before packing)
+    M = fp4_packed.shape[0]
+    K_half = fp4_packed.shape[1]
+    K = K_half * 2  # logical K
     num_blocks = K // BLOCK_SIZE
 
-    # Cast FP4 data back to compute dtype
-    data_hp = fp4_data.to(orig_dtype).reshape(M, num_blocks, BLOCK_SIZE)
-    # Reconstruct the scale: per_tensor_scale * block_scale
-    block_scales = block_scales_fp8.to(orig_dtype)  # (M, num_blocks)
-    effective_scale = per_tensor_scale.to(orig_dtype) * block_scales  # (M, num_blocks)
-    # Multiply each block by its scale
-    data_hp = data_hp * effective_scale.unsqueeze(-1)
-    return data_hp.reshape(M, K)
+    # Unpack FP4 to float32
+    data_f32 = _fp4_packed_to_f32(fp4_packed.reshape(-1), fp4_packed.device)
+    data_f32 = data_f32.reshape(M, num_blocks, BLOCK_SIZE)
+
+    # Multiply by block scales to recover original magnitude
+    block_scales = block_scales_fp8.to(torch.float32)  # (M, num_blocks)
+    data_f32 = data_f32 * block_scales.unsqueeze(-1)
+
+    return data_f32.reshape(M, K).to(orig_dtype)
 
 
 @torch._dynamo.allow_in_graph
@@ -191,18 +203,16 @@ class _Float4Matmul(torch.autograd.Function):
 
     Forward: quantize input and weight to FP4, matmul via _scaled_mm.
     Backward: dequantize saved tensors to bf16, do gradient matmuls in full precision.
-    (This is the standard approach for FP4 — doing backward in FP4 loses too much.)
     """
 
     @staticmethod
     def forward(ctx, input_2d, weight):
-        # Quantize both operands to NVFP4
-        in_fp4, in_bscales, in_ptscale = _to_nvfp4(input_2d)
-        w_fp4, w_bscales, w_ptscale = _to_nvfp4(weight)
+        # Quantize both operands to NVFP4 (returns uint8 packed + FP8 scales)
+        in_packed, in_bscales = _to_nvfp4(input_2d)
+        w_packed, w_bscales = _to_nvfp4(weight)
 
         # Save for backward (we'll dequantize these for gradient computation)
-        ctx.save_for_backward(in_fp4, in_bscales, in_ptscale,
-                              w_fp4, w_bscales, w_ptscale)
+        ctx.save_for_backward(in_packed, in_bscales, w_packed, w_bscales)
         ctx.orig_dtype = input_2d.dtype
 
         M, K = input_2d.shape
@@ -212,31 +222,26 @@ class _Float4Matmul(torch.autograd.Function):
         in_scales_blocked = _to_blocked_scales(in_bscales, M, K // BLOCK_SIZE)
         w_scales_blocked = _to_blocked_scales(w_bscales, N, K // BLOCK_SIZE)
 
-        # output = input @ weight.T
-        # _scaled_mm with FP4: scales are block-wise FP8, not scalars
+        # View uint8 packed data as float4_e2m1fn_x2 for _scaled_mm
+        # This is a zero-copy reinterpret — never store as float4, only view at call site
         output = torch._scaled_mm(
-            in_fp4,
-            w_fp4.t(),
+            in_packed.view(torch.float4_e2m1fn_x2),
+            w_packed.view(torch.float4_e2m1fn_x2).t(),
             scale_a=in_scales_blocked.view(torch.float8_e4m3fn),
             scale_b=w_scales_blocked.view(torch.float8_e4m3fn),
             out_dtype=input_2d.dtype,
-            use_fast_accum=False,  # not supported for FP4 (only FP8)
+            use_fast_accum=False,  # not supported for FP4
         )
-
-        # Apply per-tensor scales (these are FP32, not baked into _scaled_mm)
-        output = output * (in_ptscale * w_ptscale).to(output.dtype)
 
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        (in_fp4, in_bscales, in_ptscale,
-         w_fp4, w_bscales, w_ptscale) = ctx.saved_tensors
+        in_packed, in_bscales, w_packed, w_bscales = ctx.saved_tensors
 
         # Fake quantization backward: dequantize to full precision, then standard matmuls.
-        # FP4 has too few representable values to do backward in reduced precision.
-        input_hp = _dequantize_nvfp4(in_fp4, in_bscales, in_ptscale, ctx.orig_dtype)
-        weight_hp = _dequantize_nvfp4(w_fp4, w_bscales, w_ptscale, ctx.orig_dtype)
+        input_hp = _dequantize_nvfp4(in_packed, in_bscales, ctx.orig_dtype)
+        weight_hp = _dequantize_nvfp4(w_packed, w_bscales, ctx.orig_dtype)
 
         # grad_input = grad_output @ weight        [B,N] @ [N,K] -> [B,K]
         grad_input = torch.mm(grad_output, weight_hp)
