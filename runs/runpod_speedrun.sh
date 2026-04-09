@@ -9,8 +9,9 @@ set -e
 # - Sources uv env file for proper shell integration
 # - Installs python3-dev (needed for torchao FP8 JIT CUDA compilation)
 # - Installs vim/tmux for convenience during long training runs
-# H100 notes:
-# - FP8 training enabled for ~10-20% speedup
+# GPU notes:
+# - FP8 training enabled by default for ~10-20% speedup (H100+)
+# - FP4 training available on Blackwell SM100+ (B100/B200) via PRECISION=fp4
 # - FA3 available, uses default SSSL sliding window pattern
 
 # 1) Example launch (simplest):
@@ -60,6 +61,15 @@ if [ -z "$WANDB_RUN" ]; then
     WANDB_RUN=dummy
 fi
 
+# Precision: fp8 (default, H100+) or fp4 (Blackwell SM100+ only)
+# Override with: PRECISION=fp4 bash runs/runpod_speedrun.sh
+PRECISION=${PRECISION:-fp8}
+if [ "$PRECISION" != "fp8" ] && [ "$PRECISION" != "fp4" ]; then
+    echo "Error: PRECISION must be 'fp8' or 'fp4', got '$PRECISION'"
+    exit 1
+fi
+PRECISION_FLAG="--${PRECISION}"
+
 # -----------------------------------------------------------------------------
 # During the course of the run, we will be writing markdown reports to the report/
 # directory in the base dir. This command clears it out and writes a header section
@@ -90,8 +100,8 @@ python -m scripts.tok_eval
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
-# d16 model on single H100 NVL with FP8 training
-python -m scripts.base_train --depth=16 --target-param-data-ratio=10 --device-batch-size=64 --total-batch-size=131072 --fp8 --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d16
+# d16 model on single GPU with reduced precision training (FP8 on H100+, FP4 on Blackwell)
+python -m scripts.base_train --depth=16 --target-param-data-ratio=10 --device-batch-size=64 --total-batch-size=131072 $PRECISION_FLAG --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d16
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
 python -m scripts.base_eval --device-batch-size=32
 
