@@ -139,7 +139,9 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         Output tensor of shape (B, T, H, D)
     """
     if USE_FA4:
-        return _fa4_func(q, k, v, causal=causal, window_size=window_size)
+        # FA4 returns (output, lse) tuple; we only need the output tensor
+        out = _fa4_func(q, k, v, causal=causal, window_size=window_size)
+        return out[0] if isinstance(out, tuple) else out
     if USE_FA3:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
