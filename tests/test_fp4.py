@@ -54,8 +54,8 @@ def test_fp4_packing():
     values = torch.tensor([1.0, 2.0])  # codes: 2, 4
     packed = _f32_to_fp4_packed(values)
     assert packed.shape == (1,)
-    # Low nibble = 2 (0b0010), high nibble = 4 (0b0100) -> byte = 0b01000010 = 66
-    assert packed[0].item() == (2 | (4 << 4))
+    # First value (1.0=code 2) in high nibble, second (2.0=code 4) in low nibble
+    assert packed[0].item() == ((2 << 4) | 4)
 
 
 # --- Quantization math tests ---

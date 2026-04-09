@@ -62,8 +62,9 @@ def _f32_to_fp4_packed(x_flat):
     code = torch.bucketize(x_flat.abs(), boundaries).to(torch.uint8)
     # Combine sign (bit 3) with magnitude code (bits 0-2)
     nibble = code | (sign << 3)
-    # Pack pairs: first value in low nibble, second in high nibble
-    return (nibble[0::2] & 0xF) | ((nibble[1::2] & 0xF) << 4)
+    # Pack pairs: first value in high nibble, second in low nibble
+    # This matches cuBLAS's expected packing for float4_e2m1fn_x2
+    return ((nibble[0::2] & 0xF) << 4) | (nibble[1::2] & 0xF)
 
 
 def _fp4_packed_to_f32(packed, device):
@@ -77,16 +78,16 @@ def _fp4_packed_to_f32(packed, device):
         float32 tensor with twice the elements.
     """
     fp4_values = torch.tensor(_FP4_VALUES_LIST, device=device)
-    # Extract low and high nibbles
-    lo = packed & 0x0F
-    hi = (packed >> 4) & 0x0F
+    # First value in high nibble, second in low nibble (matches packing order)
+    first = (packed >> 4) & 0x0F
+    second = packed & 0x0F
     # Separate sign (bit 3) and magnitude (bits 0-2)
-    lo_sign = ((lo >> 3) & 1).to(torch.float32) * -2.0 + 1.0  # 1.0 or -1.0
-    hi_sign = ((hi >> 3) & 1).to(torch.float32) * -2.0 + 1.0
-    lo_mag = fp4_values[(lo & 0x07).long()]
-    hi_mag = fp4_values[(hi & 0x07).long()]
-    # Interleave back: [lo0, hi0, lo1, hi1, ...]
-    result = torch.stack([lo_sign * lo_mag, hi_sign * hi_mag], dim=-1)
+    first_sign = ((first >> 3) & 1).to(torch.float32) * -2.0 + 1.0
+    second_sign = ((second >> 3) & 1).to(torch.float32) * -2.0 + 1.0
+    first_mag = fp4_values[(first & 0x07).long()]
+    second_mag = fp4_values[(second & 0x07).long()]
+    # Interleave back: [first0, second0, first1, second1, ...]
+    result = torch.stack([first_sign * first_mag, second_sign * second_mag], dim=-1)
     return result.view(-1)
 
 
