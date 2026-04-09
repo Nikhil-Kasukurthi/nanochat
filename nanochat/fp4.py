@@ -153,26 +153,7 @@ def _to_blocked_scales(scales, M, num_blocks):
     Returns:
         Scales in swizzled blocked layout, flattened to 1D.
     """
-    # Duplicate each scale for the two packed halves
-    scales_expanded = scales.repeat_interleave(2, dim=1)  # (M, num_blocks*2)
-    rows, cols = scales_expanded.shape
-
-    # Pad to multiples of (128, 4) as cuBLAS requires
-    n_row_blocks = _ceil_div(rows, 128)
-    n_col_blocks = _ceil_div(cols, 4)
-    padded_rows = n_row_blocks * 128
-    padded_cols = n_col_blocks * 4
-
-    padded = scales_expanded
-    if (rows, cols) != (padded_rows, padded_cols):
-        padded = torch.zeros(padded_rows, padded_cols,
-                             dtype=scales.dtype, device=scales.device)
-        padded[:rows, :cols] = scales_expanded
-
-    # Swizzle: rearrange (128, 4) tiles into (32, 16) sub-tiles
-    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
-    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
-    return rearranged.flatten()
+    return scales.contiguous().flatten()
 
 
 @torch.no_grad()
