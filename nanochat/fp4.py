@@ -38,9 +38,11 @@ EPS = 1e-12
 # FP4 e2m1 representable absolute values (8 levels) and their 4-bit codes
 # Code 0=0, 1=0.5, 2=1.0, 3=1.5, 4=2.0, 5=3.0, 6=4.0, 7=6.0
 # Sign bit is bit 3 (0=positive, 1=negative)
-_FP4_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+# Stored as plain lists — converted to tensors inside functions so torch.compile
+# can trace through them (module-level tensors cause FakeTensor errors in dynamo).
+_FP4_VALUES_LIST = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 # Boundaries for round-to-nearest between consecutive values
-_FP4_BOUNDARIES = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+_FP4_BOUNDARIES_LIST = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
 
 
 def _f32_to_fp4_packed(x_flat):
@@ -54,7 +56,7 @@ def _f32_to_fp4_packed(x_flat):
         uint8 tensor with half the elements (two FP4 values packed per byte).
         First value in bits 0-3, second value in bits 4-7.
     """
-    boundaries = _FP4_BOUNDARIES.to(x_flat.device)
+    boundaries = torch.tensor(_FP4_BOUNDARIES_LIST, device=x_flat.device)
     sign = (x_flat < 0).to(torch.uint8)
     # Map absolute values to nearest FP4 code (0-7) via bucket boundaries
     code = torch.bucketize(x_flat.abs(), boundaries).to(torch.uint8)
@@ -74,7 +76,7 @@ def _fp4_packed_to_f32(packed, device):
     Returns:
         float32 tensor with twice the elements.
     """
-    fp4_values = _FP4_VALUES.to(device)
+    fp4_values = torch.tensor(_FP4_VALUES_LIST, device=device)
     # Extract low and high nibbles
     lo = packed & 0x0F
     hi = (packed >> 4) & 0x0F
