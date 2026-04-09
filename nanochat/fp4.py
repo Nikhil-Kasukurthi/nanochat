@@ -62,8 +62,8 @@ def _f32_to_fp4_packed(x_flat):
     code = torch.bucketize(x_flat.abs(), boundaries).to(torch.uint8)
     # Combine sign (bit 3) with magnitude code (bits 0-2)
     nibble = code | (sign << 3)
-    # Pack pairs: first value in high nibble, second in low nibble
-    # This matches cuBLAS's expected packing for float4_e2m1fn_x2
+    # Pack pairs: first value in HIGH nibble, second in LOW nibble
+    # This matches torchao/cuBLAS's expected float4_e2m1fn_x2 layout
     return ((nibble[0::2] & 0xF) << 4) | (nibble[1::2] & 0xF)
 
 
@@ -78,7 +78,7 @@ def _fp4_packed_to_f32(packed, device):
         float32 tensor with twice the elements.
     """
     fp4_values = torch.tensor(_FP4_VALUES_LIST, device=device)
-    # First value in high nibble, second in low nibble (matches packing order)
+    # First value in HIGH nibble, second in LOW nibble (matches packing order)
     first = (packed >> 4) & 0x0F
     second = packed & 0x0F
     # Separate sign (bit 3) and magnitude (bits 0-2)
