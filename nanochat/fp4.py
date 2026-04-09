@@ -220,7 +220,7 @@ class _Float4Matmul(torch.autograd.Function):
             scale_a=in_scales_blocked.view(torch.float8_e4m3fn),
             scale_b=w_scales_blocked.view(torch.float8_e4m3fn),
             out_dtype=input_2d.dtype,
-            use_fast_accum=True,
+            use_fast_accum=False,  # not supported for FP4 (only FP8)
         )
 
         # Apply per-tensor scales (these are FP32, not baked into _scaled_mm)

@@ -51,7 +51,7 @@ source .venv/bin/activate
 # install flash-attn-4 for Blackwell GPUs (FA4 requires CuTe DSL, compiles in ~3-5 min)
 if [ "$PRECISION" = "fp4" ]; then
     echo "Installing flash-attn-4 for Blackwell (this takes a few minutes to compile)..."
-    uv pip install flash-attn-4 --prerelease=allow
+    uv pip install "flash-attn-4[cu13]" --prerelease=allow
 fi
 
 # -----------------------------------------------------------------------------
