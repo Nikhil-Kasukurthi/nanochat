@@ -60,8 +60,9 @@ _fa3 = _load_flash_attention_3()
 HAS_FA4 = _fa4_func is not None
 HAS_FA3 = _fa3 is not None
 
-# Override for testing: set to 'fa4', 'fa3', 'sdpa', or None (auto)
-_override_impl = None
+# Override via env var NANOCHAT_ATTN_IMPL='fa4'|'fa3'|'sdpa', or None for auto-detect
+import os
+_override_impl = os.environ.get('NANOCHAT_ATTN_IMPL', None)
 
 
 def _resolve_impl():

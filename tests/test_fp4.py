@@ -1,0 +1,168 @@
+"""Tests for NVFP4 quantization (nanochat/fp4.py).
+
+Tests the quantization math, FP4 encoding, and module conversion logic.
+The actual _scaled_mm with float4_e2m1fn_x2 requires Blackwell GPUs,
+so we test everything up to that point on any hardware.
+"""
+
+import pytest
+import torch
+import torch.nn as nn
+
+from nanochat.fp4 import (
+    _to_nvfp4,
+    _dequantize_nvfp4,
+    _f32_to_fp4_packed,
+    _fp4_packed_to_f32,
+    _to_blocked_scales,
+    Float4Linear,
+    convert_to_float4_training,
+    FP4_E2M1_MAX,
+    FP8_E4M3_MAX,
+    EPS,
+    BLOCK_SIZE,
+)
+
+
+# --- FP4 encoding/decoding tests ---
+
+def test_fp4_roundtrip_values():
+    """FP4 encode -> decode should recover representable values exactly."""
+    # All representable FP4 values (positive and negative)
+    values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                           -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+    packed = _f32_to_fp4_packed(values)
+    recovered = _fp4_packed_to_f32(packed, packed.device)
+    assert torch.allclose(values.abs(), recovered.abs()), f"Expected {values}, got {recovered}"
+
+
+def test_fp4_rounding():
+    """Values between representable FP4 values should round to nearest."""
+    # 0.3 is between 0 (code 0) and 0.5 (code 1), boundary at 0.25 -> rounds to 0.5
+    # 0.6 is between 0.5 and 1.0, boundary at 0.75 -> rounds to 0.5
+    # 2.4 is between 2.0 and 3.0, boundary at 2.5 -> rounds to 2.0
+    # 5.5 is between 4.0 and 6.0, boundary at 5.0 -> rounds to 6.0
+    values = torch.tensor([0.3, 0.6, 2.4, 5.5, -0.3, -0.6, -2.4, -5.5])
+    packed = _f32_to_fp4_packed(values)
+    recovered = _fp4_packed_to_f32(packed, packed.device)
+    expected = torch.tensor([0.5, 0.5, 2.0, 6.0, -0.5, -0.5, -2.0, -6.0])
+    assert torch.allclose(recovered, expected), f"Expected {expected}, got {recovered}"
+
+
+def test_fp4_packing():
+    """Two FP4 values should be packed into one byte correctly."""
+    values = torch.tensor([1.0, 2.0])  # codes: 2, 4
+    packed = _f32_to_fp4_packed(values)
+    assert packed.shape == (1,)
+    # Low nibble = 2 (0b0010), high nibble = 4 (0b0100) -> byte = 0b01000010 = 66
+    assert packed[0].item() == (2 | (4 << 4))
+
+
+# --- Quantization math tests ---
+
+def test_block_scales_shape():
+    """Block scales should have shape (M, K//16)."""
+    M, K = 4, 64
+    x = torch.randn(M, K)
+    fp4_packed, block_scales = _to_nvfp4(x)
+    assert block_scales.shape == (M, K // BLOCK_SIZE)
+    assert block_scales.dtype == torch.float8_e4m3fn
+
+
+def test_packed_data_shape():
+    """Packed FP4 data should have shape (M, K//2)."""
+    M, K = 4, 64
+    x = torch.randn(M, K)
+    fp4_packed, _ = _to_nvfp4(x)
+    assert fp4_packed.shape == (M, K // 2)
+    assert fp4_packed.dtype == torch.uint8
+
+
+def test_dequantize_roundtrip():
+    """Quantize -> dequantize should approximately recover original values."""
+    M, K = 8, 64
+    x = torch.randn(M, K)
+    fp4_packed, block_scales = _to_nvfp4(x)
+    x_recovered = _dequantize_nvfp4(fp4_packed, block_scales, torch.float32)
+
+    # FP4 has very few representable values, so relative error will be high
+    # but the values should be in the right ballpark (no NaN, similar range)
+    assert not x_recovered.isnan().any()
+    assert x_recovered.shape == x.shape
+    # Mean absolute error should be reasonable (less than the scale of the data)
+    mae = (x - x_recovered).abs().mean()
+    data_scale = x.abs().mean()
+    assert mae < data_scale, f"MAE {mae:.4f} too large vs data scale {data_scale:.4f}"
+
+
+def test_zero_tensor():
+    """All-zeros tensor should not cause division by zero."""
+    x = torch.zeros(4, 32)
+    fp4_packed, block_scales = _to_nvfp4(x)
+    assert not block_scales.to(torch.float32).isnan().any()
+    x_recovered = _dequantize_nvfp4(fp4_packed, block_scales, torch.float32)
+    assert not x_recovered.isnan().any()
+
+
+def test_k_not_divisible_by_16():
+    """Should raise AssertionError if K is not divisible by BLOCK_SIZE."""
+    x = torch.randn(4, 17)
+    with pytest.raises(AssertionError):
+        _to_nvfp4(x)
+
+
+# --- Blocked scales tests ---
+
+def test_blocked_scales_element_count():
+    """Blocked scales should have M * K//16 elements (flat contiguous)."""
+    M, K = 256, 1024
+    num_blocks = K // BLOCK_SIZE  # 64
+    scales = torch.ones(M, num_blocks, dtype=torch.float8_e4m3fn)
+    blocked = _to_blocked_scales(scales, M, num_blocks)
+
+    expected = M * num_blocks  # 256 * 64 = 16384
+    assert blocked.numel() == expected, f"Got {blocked.numel()}, expected {expected}"
+
+
+# --- Module conversion tests ---
+
+def test_convert_to_float4():
+    """convert_to_float4_training should replace nn.Linear with Float4Linear."""
+    model = nn.Sequential(
+        nn.Linear(256, 512, bias=False),
+        nn.ReLU(),
+        nn.Linear(512, 256, bias=False),
+    )
+
+    def filter_fn(mod, fqn):
+        return mod.in_features % 16 == 0 and mod.out_features % 16 == 0
+
+    convert_to_float4_training(model, module_filter_fn=filter_fn)
+
+    assert isinstance(model[0], Float4Linear)
+    assert isinstance(model[2], Float4Linear)
+    assert isinstance(model[1], nn.ReLU)
+
+
+def test_convert_skips_small_layers():
+    """Layers with dims not divisible by 16 should be skipped."""
+    model = nn.Sequential(
+        nn.Linear(256, 512, bias=False),
+        nn.Linear(12, 6, bias=False),
+    )
+
+    def filter_fn(mod, fqn):
+        return mod.in_features % 16 == 0 and mod.out_features % 16 == 0
+
+    convert_to_float4_training(model, module_filter_fn=filter_fn)
+
+    assert isinstance(model[0], Float4Linear)
+    assert not isinstance(model[1], Float4Linear)
+
+
+def test_convert_shares_weights():
+    """Float4Linear should share weight tensors, not copy them."""
+    linear = nn.Linear(256, 512, bias=False)
+    original_weight = linear.weight
+    fp4_linear = Float4Linear.from_float(linear)
+    assert fp4_linear.weight is original_weight
