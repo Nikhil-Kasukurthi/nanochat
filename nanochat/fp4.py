@@ -109,6 +109,10 @@ def _to_nvfp4(x):
     return x_fp4, block_scales_fp8, per_tensor_scale.float()
 
 
+def _ceil_div(a, b):
+    return (a + b - 1) // b
+
+
 def _to_blocked_scales(scales, M, num_blocks):
     """Rearrange block scales into the swizzled (blocked) layout cuBLAS expects.
 
@@ -117,18 +121,48 @@ def _to_blocked_scales(scales, M, num_blocks):
     matmul. This is an implementation detail of NVIDIA's cuBLAS — the exact
     layout may change between CUDA versions.
 
+    float4_e2m1fn_x2 packs two FP4 values per byte, so cuBLAS sees the K
+    dimension as K_packed = K // 2. Block scales are computed per 16 logical
+    elements, but cuBLAS expects them per 16 packed elements (= 32 logical),
+    so each block scale must be duplicated to cover both packed halves.
+
+    The swizzled layout reorganizes (M, num_k_blocks) into tiles of
+    (128, 4) that are permuted into (32, 16) sub-tiles for cuBLAS's
+    tiling pattern.
+
+    Reference: torch/_meta_registrations.py:meta_scaled_mm (NVFP4 branch)
+    and torchao.prototype.mx_formats.utils.to_blocked()
+
     Args:
         scales: block scales of shape (M, num_blocks) in float8_e4m3fn
         M: number of rows
-        num_blocks: K // BLOCK_SIZE
+        num_blocks: K // BLOCK_SIZE (logical blocks)
 
     Returns:
-        Scales rearranged to blocked layout, same number of elements.
+        Scales in swizzled blocked layout, flattened to 1D.
     """
-    # For now, assume row-major works (it does for some cuBLAS versions).
-    # If _scaled_mm errors about scale layout, this needs the swizzle.
-    # See torchao.prototype.mx_formats.nvfp4_tensor.to_blocked() for reference.
-    return scales.contiguous()
+    BLOCK_MN = 128
+    BLOCK_K = 16  # cuBLAS block size for scales (in packed elements)
+
+    # Duplicate each scale for the two packed halves (16 logical -> 2x 16 packed)
+    scales_expanded = scales.repeat_interleave(2, dim=1)  # (M, num_blocks*2)
+    num_k_blocks = scales_expanded.shape[1]
+
+    # Pad to multiples of (BLOCK_MN, 4) as cuBLAS requires
+    n_row_blocks = _ceil_div(M, BLOCK_MN)
+    n_col_blocks = _ceil_div(num_k_blocks, 4)
+    padded_rows = n_row_blocks * BLOCK_MN
+    padded_cols = n_col_blocks * 4
+
+    padded = torch.zeros(padded_rows, padded_cols, dtype=scales.dtype, device=scales.device)
+    padded[:M, :num_k_blocks] = scales_expanded
+
+    # Swizzle: rearrange (128, 4) tiles into (32, 16) sub-tiles
+    blocks = padded.view(n_row_blocks, BLOCK_MN, n_col_blocks, 4)
+    blocks = blocks.permute(0, 2, 1, 3)  # (n_row, n_col, 128, 4)
+    blocks = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, BLOCK_K)
+
+    return blocks.flatten().contiguous()
 
 
 @torch.no_grad()
