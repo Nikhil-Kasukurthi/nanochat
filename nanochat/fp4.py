@@ -62,9 +62,9 @@ def _f32_to_fp4_packed(x_flat):
     code = torch.bucketize(x_flat.abs(), boundaries).to(torch.uint8)
     # Combine sign (bit 3) with magnitude code (bits 0-2)
     nibble = code | (sign << 3)
-    # Pack pairs: first value in HIGH nibble, second in LOW nibble
-    # This matches torchao/cuBLAS's expected float4_e2m1fn_x2 layout
-    return ((nibble[0::2] & 0xF) << 4) | (nibble[1::2] & 0xF)
+    # Pack pairs: first value in LOW nibble, second in HIGH nibble
+    # This matches torchao's pack_uint4 convention for float4_e2m1fn_x2
+    return (nibble[0::2] & 0xF) | ((nibble[1::2] & 0xF) << 4)
 
 
 def _fp4_packed_to_f32(packed, device):
@@ -78,9 +78,9 @@ def _fp4_packed_to_f32(packed, device):
         float32 tensor with twice the elements.
     """
     fp4_values = torch.tensor(_FP4_VALUES_LIST, device=device)
-    # First value in HIGH nibble, second in LOW nibble (matches packing order)
-    first = (packed >> 4) & 0x0F
-    second = packed & 0x0F
+    # First value in LOW nibble, second in HIGH nibble (matches packing order)
+    first = packed & 0x0F
+    second = (packed >> 4) & 0x0F
     # Separate sign (bit 3) and magnitude (bits 0-2)
     first_sign = ((first >> 3) & 1).to(torch.float32) * -2.0 + 1.0
     second_sign = ((second >> 3) & 1).to(torch.float32) * -2.0 + 1.0
@@ -156,7 +156,9 @@ def _to_blocked_scales(scales, M, num_blocks):
     Returns:
         Scales in swizzled blocked layout, flattened to 1D.
     """
-    return scales.contiguous().flatten()
+    # Use torchao's swizzle which pads to (128, 4) tiles and rearranges
+    from torchao.prototype.mx_formats.utils import to_blocked
+    return to_blocked(scales)
 
 
 @torch.no_grad()
