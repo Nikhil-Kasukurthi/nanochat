@@ -50,8 +50,13 @@ uv sync --extra gpu
 source .venv/bin/activate
 # install flash-attn-4 for Blackwell GPUs (FA4 requires CuTe DSL, compiles in ~3-5 min)
 if [ "$PRECISION" = "fp4" ]; then
+    echo "Installing TransformerEngine for NVFP4 training on Blackwell..."
+    uv pip install --no-build-isolation "transformer_engine[pytorch]"
     echo "Installing flash-attn-4 for Blackwell (this takes a few minutes to compile)..."
     uv pip install "flash-attn-4[cu13]" --prerelease=allow
+    # Pin cutlass-dsl to stable release — the dev version (4.5.0.dev0) has a packaging
+    # bug where a _cutlass_ir/ stub directory shadows the _cutlass_ir.so extension module
+    uv pip install "nvidia-cutlass-dsl==4.4.2" "nvidia-cutlass-dsl-libs-base==4.4.2" "nvidia-cutlass-dsl-libs-cu13==4.4.2"
 fi
 
 # -----------------------------------------------------------------------------
@@ -106,7 +111,7 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # d16 model on single GPU with reduced precision training (FP8 on H100+, FP4 on Blackwell)
-python -m scripts.base_train --depth=24 --target-param-data-ratio=10 --device-batch-size=64 --total-batch-size=131072 $PRECISION_FLAG --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d24 --fp4
+python -m scripts.base_train --depth=24 --target-param-data-ratio=10 --device-batch-size=64 --total-batch-size=131072 --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d24 --fp4
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
 python -m scripts.base_eval --device-batch-size=32
 

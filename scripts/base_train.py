@@ -19,7 +19,7 @@ import time
 import math
 import argparse
 from dataclasses import asdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import wandb
 import torch
@@ -178,7 +178,8 @@ if args.fp8 or args.fp4:
         if args.fp8:
             from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
         if args.fp4:
-            from nanochat.fp4 import convert_to_float4_training
+            from nanochat.fp4 import convert_to_float4_training, get_nvfp4_recipe
+            import transformer_engine.pytorch as te
         # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
         import torch.nn as nn
 
@@ -200,13 +201,24 @@ if args.fp8 or args.fp4:
             num_quant = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
         elif args.fp4:
             convert_to_float4_training(model, module_filter_fn=quantize_module_filter)
-            num_quant = sum(1 for m in model.modules() if 'Float4' in type(m).__name__)
+            num_quant = sum(1 for m in model.modules() if isinstance(m, te.Linear))
 
 
         num_skipped = num_linear - num_quant
 
-        quant_label = f"FP8 ({args.fp8_recipe} scaling)" if args.fp8 else "FP4 (blockwise scaling)"
+        quant_label = f"FP8 ({args.fp8_recipe} scaling)" if args.fp8 else "FP4 (NVFP4 via TransformerEngine)"
         print0(f"✓ {quant_label} training enabled - converted {num_quant}/{num_linear} linear layers, skipped {num_skipped} (too small)")
+
+# Initialize NVFP4 autocast context for training loop
+# When fp4 is active, fp4_autocast wraps forward pass to enable NVFP4 on te.Linear layers
+# When fp4 is inactive, fp4_autocast is just nullcontext (no-op)
+if args.fp4:
+    from nanochat.fp4 import get_nvfp4_recipe
+    _nvfp4_recipe = get_nvfp4_recipe()
+    def fp4_autocast():
+        return te.autocast(recipe=_nvfp4_recipe)
+else:
+    fp4_autocast = nullcontext
 
 # Context manager to temporarily disable FP8/FP4 so that model evaluation remains in BF16
 @contextmanager
@@ -218,10 +230,15 @@ def disable_fp8(model):
     """
     import torch.nn as nn
 
-    # Find all Float8Linear/Float4Linear modules and their locations
+    # Find all quantized Linear modules (Float8Linear or te.Linear) and their locations
+    def _is_quantized_linear(module):
+        cls_name = type(module).__name__
+        mod_name = type(module).__module__ or ""
+        return 'Float8' in cls_name or (cls_name == 'Linear' and 'transformer_engine' in mod_name)
+
     fp8_locations = []  # list of (parent_module, attr_name, quantized_module)
     for name, module in model.named_modules():
-        if 'Float8' in type(module).__name__ or 'Float4' in type(module).__name__:
+        if _is_quantized_linear(module):
             if '.' in name:
                 parent_name, attr_name = name.rsplit('.', 1)
                 parent = model.get_submodule(parent_name)
@@ -525,7 +542,9 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        # fp4_autocast enables NVFP4 for te.Linear layers; no-op when not using FP4
+        with fp4_autocast():
+            loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:

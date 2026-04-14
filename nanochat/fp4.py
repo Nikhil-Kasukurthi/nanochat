@@ -1,350 +1,65 @@
-"""Minimal NVFP4 training for nanochat — two-level block-wise scaling.
+"""NVFP4 training for nanochat via NVIDIA TransformerEngine.
 
-Drop-in replacement for Float8Linear using 4-bit floating point (NVFP4).
-Requires Blackwell (SM100+) GPUs — float4_e2m1fn_x2 is not supported on H100.
+Uses TransformerEngine's te.Linear with NVFP4BlockScaling recipe for production-grade
+FP4 training on Blackwell GPUs. This replaces our custom FP4 implementation with
+NVIDIA's fused CUDA kernels that handle:
+  - Two-level block scaling (16-element blocks + global FP32 scale)
+  - 2D weight quantization (16×16 blocks for weights)
+  - Stochastic rounding for gradients
+  - Random Hadamard Transform for wgrad
+  - FP4 GEMMs in all three passes (forward, grad_input, grad_weight)
+  - Full torch.compile compatibility (proper custom ops with FakeTensor support)
 
-How NVFP4 works
-================
-FP4 has only 1 mantissa bit (e2m1: representable values are {0, 0.5, 1, 1.5, 2,
-3, 4, 6}). One global scale would destroy precision, so NVFP4 uses two-level
-block-wise scaling:
-  - Per-tensor scale: amax / (FP8_MAX * FP4_MAX), normalizes dynamic range
-  - Per-block scale: one FP8 e4m3 scale per block of 16 elements
+Requirements:
+  pip install --no-build-isolation transformer_engine[pytorch]
+  Requires TransformerEngine >= 2.7 for NVFP4BlockScaling support.
 
-The matmul path is:
-  1. Quantize input/weight to FP4 with two-level scaling
-  2. torch._scaled_mm with FP4 data + block scales (cuBLAS Blackwell kernel)
-  3. Multiply output by per-tensor scale product
-
-Backward pass uses fake quantization: dequantize to bf16 for gradient matmuls.
-FP4 encoding uses IEEE round-to-nearest-even bit manipulation (inlined from
-torchao/prototype/custom_fp_utils.py, specialized for e2m1).
-
-Reference: pytorch/ao torchao/prototype/mx_formats/nvfp4_tensor.py
+Reference: https://developer.nvidia.com/blog/using-nvfp4-low-precision-model-training-for-higher-throughput-without-losing-accuracy
 """
 
-import torch
 import torch.nn as nn
 
-from nanochat.common import COMPUTE_DTYPE
-
-BLOCK_SIZE = 16
-FP4_E2M1_MAX = 6.0  # max representable value in float4 e2m1
-FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-# Smallest normal FP8 e4m3 value (~1.53e-05). Using 1e-12 is wrong because
-# values below tiny flush to zero when cast to FP8, causing inf on reciprocal.
-FP8_E4M3_TINY = torch.finfo(torch.float8_e4m3fn).tiny
-
-# --- FP4 e2m1 encoding/decoding (inlined from torchao) -----------------------
-#
-# FP4 e2m1 bit layout: [sign(1) | exponent(2) | mantissa(1)] stored in bits 0-3
-# of a uint8. The 8 representable magnitudes map to codes 0-7:
-#   code 0=0.0, 1=0.5(denormal), 2=1.0, 3=1.5, 4=2.0, 5=3.0, 6=4.0, 7=6.0
-#
-# Encoding uses IEEE-style bit manipulation with round-to-nearest-even, matching
-# hardware behavior. Decoding uses a fast lookup table (only 16 possible codes).
-#
-# Reference: torchao/prototype/custom_fp_utils.py (_f32_to_floatx_unpacked)
-
-# Pre-computed constants for FP4 e2m1 encoding
-_FP4_EXP_BIAS = 1                # 2^(ebits-1) - 1 = 2^1 - 1 = 1
-_FP4_MAX_INT = 7                  # 2^(ebits+mbits) - 1 = 2^3 - 1
-_FP4_SIGN_MASK = 8                # 1 << (ebits+mbits) = 1 << 3
-_FP4_MAX_NORMAL = 6.0             # 2^(3-1) * (3/2) = 6.0
-_FP4_MIN_NORMAL = 1.0             # 2^(1-1) = 1.0
-_FP4_MAGIC_ADDER = 0x1FFFFF       # (1 << 21) - 1, for round-to-nearest-even
-# For denormal conversion: (F32_bias - FP4_bias + F32_mantissa - FP4_mantissa + 1) << 23
-_FP4_DENORM_MASK_INT = 149 << 23  # (127 - 1 + 23 - 1 + 1) << 23
-_FP4_DENORM_MASK_FLOAT = torch.tensor(_FP4_DENORM_MASK_INT, dtype=torch.int32).view(torch.float32)
-# For normal encoding: (FP4_bias - F32_bias) << 23 + magic_adder
-_FP4_NORMAL_ADJUST = ((_FP4_EXP_BIAS - 127) << 23) + _FP4_MAGIC_ADDER
-
-# Lookup table for decoding: FP4 code (0-15, with sign in bit 3) -> float32
-# Positive: 0=0.0, 1=0.5, 2=1.0, 3=1.5, 4=2.0, 5=3.0, 6=4.0, 7=6.0
-# Negative (bit 3 set): 8=-0.0, 9=-0.5, 10=-1.0, ... 15=-6.0
-_FP4_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import NVFP4BlockScaling
 
 
-def _f32_to_fp4_packed(x_flat):
-    """Convert float32 to packed FP4 e2m1 uint8 using IEEE round-to-nearest-even.
-
-    Args:
-        x_flat: 1D float tensor (even length), values in [-6.0, 6.0].
-    Returns:
-        uint8 tensor with half the elements (two FP4 values per byte).
-    """
-    x = x_flat.float()
-    # Extract and remove sign
-    x_int = x.view(torch.int32)
-    sign = x_int & 0x80000000
-    x = (x_int ^ sign).view(torch.float32)
-
-    # Three branches: saturate, denormal, normal
-    saturate_mask = x >= _FP4_MAX_NORMAL
-    denormal_mask = (~saturate_mask) & (x < _FP4_MIN_NORMAL)
-    normal_mask = ~(saturate_mask | denormal_mask)
-
-    # Denormal path: add magic float, subtract magic int, truncate to uint8
-    # This trick converts small floats to the correct denormal code via FP addition
-    denormal_x = (x + _FP4_DENORM_MASK_FLOAT.to(x.device)).view(torch.int32) - _FP4_DENORM_MASK_INT
-    denormal_x = denormal_x.to(torch.uint8)
-
-    # Normal path: adjust exponent bias + round-to-nearest-even via magic adder
-    normal_x = x.view(torch.int32)
-    mant_odd = (normal_x >> 22) & 1  # bit 22 = LSB of mantissa we keep
-    normal_x = ((normal_x + _FP4_NORMAL_ADJUST + mant_odd) >> 22).to(torch.uint8)
-
-    # Combine: saturated -> max code (7), denormal -> computed, normal -> computed
-    result = torch.full_like(x, _FP4_MAX_INT, dtype=torch.uint8)
-    result = torch.where(denormal_mask, denormal_x, result)
-    result = torch.where(normal_mask, normal_x, result)
-
-    # Add sign bit (bit 3 of FP4)
-    sign_lp = (sign >> 28).to(torch.uint8) & _FP4_SIGN_MASK
-    nibble = result | sign_lp
-
-    # Pack pairs: first value in LOW nibble, second in HIGH nibble
-    return (nibble[0::2] & 0xF) | ((nibble[1::2] & 0xF) << 4)
-
-
-def _fp4_packed_to_f32(packed, device):
-    """Unpack packed FP4 uint8 to float32 via lookup table.
-
-    Args:
-        packed: uint8 tensor with two FP4 values per byte.
-        device: target device.
-    Returns:
-        float32 tensor with twice the elements.
-    """
-    lut = torch.tensor(_FP4_LUT, dtype=torch.float32, device=device)
-    first = packed & 0x0F
-    second = (packed >> 4) & 0x0F
-    return torch.stack([lut[first.long()], lut[second.long()]], dim=-1).view(-1)
-
-
-def _per_tensor_amax_to_scale(amax):
-    """Convert per-tensor amax to per-tensor scale for two-level NVFP4 scaling.
-
-    Divides by both FP8_E4M3_MAX and FP4_E2M1_MAX so that block scales can
-    utilize the full FP8 e4m3 range when block_max equals tensor_max.
-    """
-    return amax.float() / (FP8_E4M3_MAX * FP4_E2M1_MAX)
-
-
-@torch.no_grad()
-def _to_nvfp4(x, per_tensor_scale=None):
-    """Quantize a 2D tensor to NVFP4 using block-wise scaling.
-
-    Supports two scaling modes:
-      - Single-level (per_tensor_scale=None): block_scale = max(|block|) / FP4_E2M1_MAX
-      - Two-level (per_tensor_scale given): block scales are normalized by the
-        per-tensor scale so they better utilize the FP8 range.
-
-    Args:
-        x: Input tensor of shape (M, K) where K must be divisible by BLOCK_SIZE (16).
-        per_tensor_scale: Optional global scale from _per_tensor_amax_to_scale().
-
-    Returns:
-        (fp4_packed, block_scales_fp8) where:
-        - fp4_packed: shape (M, K//2) in uint8 (two FP4 values per byte)
-        - block_scales_fp8: shape (M, K//16) in float8_e4m3fn
-    """
-    M, K = x.shape
-    assert K % BLOCK_SIZE == 0, f"K={K} must be divisible by BLOCK_SIZE={BLOCK_SIZE}"
-
-    # Reshape into blocks of 16
-    x_blocks = x.float().reshape(M, K // BLOCK_SIZE, BLOCK_SIZE)
-
-    # Block scales: one FP8 scale per block
-    block_amax = x_blocks.abs().amax(dim=-1)  # (M, K//16)
-    block_scale = block_amax / FP4_E2M1_MAX
-
-    if per_tensor_scale is None:
-        # Single-level: quantize block scales directly to FP8
-        block_scale = block_scale.clamp(min=FP8_E4M3_TINY, max=FP8_E4M3_MAX)
-        block_scales_fp8 = block_scale.to(torch.float8_e4m3fn)
-        block_scale_f32 = block_scales_fp8.to(torch.float32)
-        x_scaled = x_blocks * (1.0 / block_scale_f32).unsqueeze(-1)
-    else:
-        # Two-level: normalize block scales by per_tensor_scale before FP8 quantization.
-        # This lets block scales use the full FP8 range even when tensor dynamic range is large.
-        scaled_block_scales = block_scale / per_tensor_scale
-        scaled_block_scales = scaled_block_scales.clamp(min=FP8_E4M3_TINY, max=FP8_E4M3_MAX)
-        block_scales_fp8 = scaled_block_scales.to(torch.float8_e4m3fn)
-        scaled_block_scales_f32 = block_scales_fp8.to(torch.float32)
-        # Combined reciprocal: x * (1/per_tensor_scale) / block_scale, matching MSLK numerics
-        reciprocal_scale = (1.0 / per_tensor_scale) / scaled_block_scales_f32
-        x_scaled = x_blocks * reciprocal_scale.unsqueeze(-1)
-
-    x_scaled = x_scaled.clamp(-FP4_E2M1_MAX, FP4_E2M1_MAX)
-
-    # Encode to packed uint8 using IEEE round-to-nearest-even (two FP4 values per byte)
-    fp4_packed = _f32_to_fp4_packed(x_scaled.reshape(-1))
-    fp4_packed = fp4_packed.reshape(M, K // 2)
-
-    return fp4_packed, block_scales_fp8
-
-
-def _to_blocked_scales(scales, M, num_blocks):
-    """Rearrange block scales into the swizzled (blocked) layout cuBLAS expects.
-
-    cuBLAS NVFP4 kernels read scales in a specific tiled order. This function
-    pads to (128, 4) tiles and rearranges into 32x16 blocks.
-
-    Reference: https://docs.nvidia.com/cuda/cublas/index.html#d-block-scaling-factors-layout
-
-    Args:
-        scales: block scales of shape (M, num_blocks) in float8_e4m3fn
-        M: number of rows
-        num_blocks: K // BLOCK_SIZE (logical blocks)
-
-    Returns:
-        Scales in swizzled blocked layout, flattened to 1D.
-    """
-    rows, cols = scales.shape
-    nr = (rows + 127) // 128
-    nc = (cols + 3) // 4
-    # Pad to tile boundaries (128 rows, 4 cols)
-    padded = torch.zeros(nr * 128, nc * 4, device=scales.device, dtype=scales.dtype)
-    padded[:rows, :cols] = scales
-    # Rearrange: split into 128x4 blocks, then subdivide into 32x4 sub-blocks
-    blocks = padded.view(nr, 128, nc, 4).permute(0, 2, 1, 3)
-    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
-
-
-@torch.no_grad()
-def _dequantize_nvfp4(fp4_packed, block_scales_fp8, orig_dtype, per_tensor_scale=None):
-    """Dequantize NVFP4 back to high precision for backward pass.
-
-    Reverses the quantization: unpack FP4 → float, then multiply by block scales
-    (and per_tensor_scale if two-level scaling was used).
-    """
-    M = fp4_packed.shape[0]
-    K_half = fp4_packed.shape[1]
-    K = K_half * 2  # logical K
-    num_blocks = K // BLOCK_SIZE
-
-    # Unpack FP4 to float32 via lookup table
-    data_f32 = _fp4_packed_to_f32(fp4_packed.reshape(-1), fp4_packed.device)
-    data_f32 = data_f32.reshape(M, num_blocks, BLOCK_SIZE)
-
-    # Multiply by block scales to recover original magnitude
-    block_scales = block_scales_fp8.to(torch.float32)  # (M, num_blocks)
-    data_f32 = data_f32 * block_scales.unsqueeze(-1)
-
-    # Two-level scaling: also multiply by per_tensor_scale to fully recover magnitude
-    if per_tensor_scale is not None:
-        data_f32 = data_f32 * per_tensor_scale
-
-    return data_f32.reshape(M, K).to(orig_dtype)
-
-
-@torch._dynamo.allow_in_graph
-class _Float4Matmul(torch.autograd.Function):
-    """Custom autograd for NVFP4 forward with fake-quantized backward.
-
-    Forward: quantize input and weight to FP4, matmul via _scaled_mm.
-    Backward: dequantize saved tensors to bf16, do gradient matmuls in full precision.
-    """
-
-    @staticmethod
-    def forward(ctx, input_2d, weight):
-        M, K = input_2d.shape
-        N = weight.shape[0]
-
-        # Two-level scaling: compute per-tensor scales for better FP8 range utilization
-        in_pts = _per_tensor_amax_to_scale(input_2d.abs().amax())
-        w_pts = _per_tensor_amax_to_scale(weight.abs().amax())
-
-        # Quantize both operands to NVFP4 with two-level scaling
-        in_packed, in_bscales = _to_nvfp4(input_2d, per_tensor_scale=in_pts)
-        w_packed, w_bscales = _to_nvfp4(weight, per_tensor_scale=w_pts)
-
-        # Save for backward (we'll dequantize these for gradient computation)
-        ctx.save_for_backward(in_packed, in_bscales, w_packed, w_bscales, in_pts, w_pts)
-        ctx.orig_dtype = input_2d.dtype
-
-        # Prepare block scales in the layout cuBLAS expects
-        in_scales_blocked = _to_blocked_scales(in_bscales, M, K // BLOCK_SIZE)
-        w_scales_blocked = _to_blocked_scales(w_bscales, N, K // BLOCK_SIZE)
-
-        # View uint8 packed data as float4_e2m1fn_x2 for _scaled_mm
-        # This is a zero-copy reinterpret — never store as float4, only view at call site
-        output = torch._scaled_mm(
-            in_packed.view(torch.float4_e2m1fn_x2),
-            w_packed.view(torch.float4_e2m1fn_x2).t(),
-            scale_a=in_scales_blocked.view(torch.float8_e4m3fn),
-            scale_b=w_scales_blocked.view(torch.float8_e4m3fn),
-            out_dtype=input_2d.dtype,
-            use_fast_accum=False,  # not supported for FP4
-        )
-
-        # Apply per-tensor scales: output was computed with normalized block scales,
-        # so we multiply by the product of per-tensor scales to recover correct magnitude
-        output = output * (in_pts * w_pts).to(input_2d.dtype)
-
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        in_packed, in_bscales, w_packed, w_bscales, in_pts, w_pts = ctx.saved_tensors
-
-        # Fake quantization backward: dequantize to full precision, then standard matmuls.
-        input_hp = _dequantize_nvfp4(in_packed, in_bscales, ctx.orig_dtype, per_tensor_scale=in_pts)
-        weight_hp = _dequantize_nvfp4(w_packed, w_bscales, ctx.orig_dtype, per_tensor_scale=w_pts)
-
-        # grad_input = grad_output @ weight        [B,N] @ [N,K] -> [B,K]
-        grad_input = torch.mm(grad_output, weight_hp)
-        # grad_weight = grad_output.T @ input      [N,B] @ [B,K] -> [N,K]
-        grad_weight = torch.mm(grad_output.t(), input_hp)
-
-        return grad_input, grad_weight
-
-
-class Float4Linear(nn.Linear):
-    """Drop-in nn.Linear replacement that does NVFP4 compute in forward.
-
-    Weights stay in original precision. Only the forward matmul uses FP4.
-    Backward uses fake quantization (dequantize -> bf16 matmuls).
-    """
-
-    def forward(self, input):
-        input = input.to(COMPUTE_DTYPE)
-        orig_shape = input.shape
-        input_2d = input.reshape(-1, orig_shape[-1])
-        output = _Float4Matmul.apply(input_2d, self.weight)
-        output = output.reshape(*orig_shape[:-1], output.shape[-1])
-        if self.bias is not None:
-            output = output + self.bias.to(output.dtype)
-        return output
-
-    @classmethod
-    def from_float(cls, mod):
-        """Create Float4Linear from nn.Linear, sharing weight and bias."""
-        with torch.device("meta"):
-            new_mod = cls(mod.in_features, mod.out_features, bias=False)
-        new_mod.weight = mod.weight
-        new_mod.bias = mod.bias
-        return new_mod
+def get_nvfp4_recipe():
+    """Return the NVFP4BlockScaling recipe for use with te.autocast."""
+    return NVFP4BlockScaling()
 
 
 def convert_to_float4_training(module, *, module_filter_fn=None):
-    """Replace nn.Linear layers with Float4Linear throughout a module.
+    """Replace nn.Linear layers with te.Linear throughout a module.
 
-    Same tree-walk pattern as convert_to_float8_training. Shares original
-    weight/bias tensors — no copies, no extra memory.
+    te.Linear is a drop-in replacement that uses NVFP4 when wrapped in
+    te.autocast(recipe=NVFP4BlockScaling()). Outside autocast, it behaves
+    like a normal nn.Linear in the params_dtype.
 
-    Note: NVFP4 requires K dimension divisible by 16 (BLOCK_SIZE). The
-    module_filter_fn should skip layers that don't meet this requirement.
+    Args:
+        module: Root module to convert.
+        module_filter_fn: Optional filter(module, fqn) -> bool. Only matching
+            Linears are converted. Common use: skip layers with dims not
+            divisible by 16.
     """
     def _convert(mod, prefix=""):
         for name, child in mod.named_children():
             fqn = f"{prefix}.{name}" if prefix else name
             _convert(child, fqn)
-            if isinstance(child, nn.Linear) and not isinstance(child, Float4Linear):
+            if isinstance(child, nn.Linear) and not isinstance(child, te.Linear):
                 if module_filter_fn is None or module_filter_fn(child, fqn):
-                    setattr(mod, name, Float4Linear.from_float(child))
+                    # Create te.Linear sharing the same weight
+                    te_linear = te.Linear(
+                        child.in_features,
+                        child.out_features,
+                        bias=child.bias is not None,
+                        params_dtype=child.weight.dtype,
+                        device="meta",  # avoid VRAM spike
+                    )
+                    # Share weight and bias tensors (no copies)
+                    te_linear.weight = child.weight
+                    if child.bias is not None:
+                        te_linear.bias = child.bias
+                    setattr(mod, name, te_linear)
 
     _convert(module)
     return module

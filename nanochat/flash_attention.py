@@ -86,6 +86,15 @@ USE_FA4 = _IMPL == 'fa4'
 USE_FA3 = _IMPL == 'fa3'
 
 
+# FA4 uses CUTLASS DSL with MLIR codegen that torch.compile/inductor cannot handle.
+# Wrap FA4 calls with torch.compiler.disable to create a graph break — the FA4 kernel
+# is already highly optimized so there's nothing for inductor to improve.
+@torch.compiler.disable
+def _call_fa4(q, k, v, causal, window_size):
+    out = _fa4_func(q, k, v, causal=causal, window_size=window_size)
+    return out[0] if isinstance(out, tuple) else out
+
+
 # =============================================================================
 # SDPA helpers
 # =============================================================================
@@ -140,9 +149,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         Output tensor of shape (B, T, H, D)
     """
     if USE_FA4:
-        # FA4 returns (output, lse) tuple; we only need the output tensor
-        out = _fa4_func(q, k, v, causal=causal, window_size=window_size)
-        return out[0] if isinstance(out, tuple) else out
+        return _call_fa4(q, k, v, causal, window_size)
     if USE_FA3:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
