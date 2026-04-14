@@ -152,15 +152,6 @@ mkdir -p profile_output/d12/nsys_trace
 # nsys sends SIGTERM to children during teardown, producing a non-zero exit.
 # || true prevents set -e from aborting before d26 profiling runs.
 export TORCHRUN="torchrun --standalone --nproc_per_node=$NUM_GPUS -m scripts.profile_comms --"
-nsys profile \
-      --python-backtrace=cuda \
-      --pytorch autograd-shapes-nvtx \
-      -o profile_output/d12/nsys_trace \
-      --trace=cuda,nvtx,osrt \
-      --capture-range=cudaProfilerApi \
-      $TORCHRUN --depth 12 --num-steps 10 --warmup-steps 3 --device-batch-size 32 --fp8 --output-dir profile_output/d12 \
-      || true
-
 # --- d26 profiling ---
 
 mkdir -p profile_output/d26/nsys_trace

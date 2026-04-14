@@ -106,7 +106,7 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # d16 model on single GPU with reduced precision training (FP8 on H100+, FP4 on Blackwell)
-python -m scripts.base_train --depth=24 --target-param-data-ratio=10 --device-batch-size=64 --total-batch-size=131072 $PRECISION_FLAG --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d24
+python -m scripts.base_train --depth=24 --target-param-data-ratio=10 --device-batch-size=64 --total-batch-size=131072 $PRECISION_FLAG --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d24 --fp4
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
 python -m scripts.base_eval --device-batch-size=32
 
