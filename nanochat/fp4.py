@@ -1,32 +1,41 @@
-"""NVFP4 training for nanochat via NVIDIA TransformerEngine.
+"""Low-precision training for nanochat via NVIDIA TransformerEngine.
 
-Uses TransformerEngine's te.Linear with NVFP4BlockScaling recipe for production-grade
-FP4 training on Blackwell GPUs. This replaces our custom FP4 implementation with
-NVIDIA's fused CUDA kernels that handle:
-  - Two-level block scaling (16-element blocks + global FP32 scale)
-  - 2D weight quantization (16×16 blocks for weights)
-  - Stochastic rounding for gradients
-  - Random Hadamard Transform for wgrad
-  - FP4 GEMMs in all three passes (forward, grad_input, grad_weight)
-  - Full torch.compile compatibility (proper custom ops with FakeTensor support)
+Supports NVFP4 and MXFP8 block-scaled recipes on Blackwell GPUs.
+TransformerEngine provides fused CUDA kernels with full torch.compile support.
+
+Recipes:
+  NVFP4 — 4-bit matmuls with 16-element blocks, 2D weight scaling, RHT, stochastic rounding
+  MXFP8 — 8-bit matmuls with 32-element blocks, E8M0 block scales
 
 Requirements:
   pip install --no-build-isolation transformer_engine[pytorch]
-  Requires TransformerEngine >= 2.7 for NVFP4BlockScaling support.
-
-Reference: https://developer.nvidia.com/blog/using-nvfp4-low-precision-model-training-for-higher-throughput-without-losing-accuracy
+  TransformerEngine >= 2.7 for block scaling recipes.
 """
 
 import torch
 import torch.nn as nn
 
 import transformer_engine.pytorch as te
-from transformer_engine.common.recipe import NVFP4BlockScaling
+from transformer_engine.common.recipe import NVFP4BlockScaling, MXFP8BlockScaling
 
 
+def get_te_recipe(name="nvfp4"):
+    """Return a TransformerEngine recipe for use with te.autocast.
+
+    Args:
+        name: 'nvfp4' for FP4 block scaling, 'mxfp8' for MXFP8 block scaling.
+    """
+    if name == "nvfp4":
+        return NVFP4BlockScaling()
+    elif name == "mxfp8":
+        return MXFP8BlockScaling()
+    else:
+        raise ValueError(f"Unknown recipe: {name}. Use 'nvfp4' or 'mxfp8'.")
+
+
+# Keep backward compat
 def get_nvfp4_recipe():
-    """Return the NVFP4BlockScaling recipe for use with te.autocast."""
-    return NVFP4BlockScaling()
+    return get_te_recipe("nvfp4")
 
 
 def convert_to_float4_training(module, *, module_filter_fn=None):

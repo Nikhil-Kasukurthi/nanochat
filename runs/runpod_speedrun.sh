@@ -70,17 +70,9 @@ python -m scripts.tok_eval
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
-# d24 model on 8xB200 with NVFP4
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
-    --depth=24 \
-    --target-param-data-ratio=10 \
-    --device-batch-size=32 \
-    --fp4 \
-    --run=$WANDB_RUN \
-    --save-every=1000 \
-    --eval-every=500
-
-# Evaluate
+# d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp4 --run=$WANDB_RUN
+# evaluate the model: CORE metric, BPB on train/val, and draw samples
 python -m scripts.base_eval --device-batch-size=16
 
 # -----------------------------------------------------------------------------
@@ -89,12 +81,9 @@ python -m scripts.base_eval --device-batch-size=16
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl \
     https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- \
-    --device-batch-size=32 \
-    --total-batch-size=32768 \
-    --run=$WANDB_RUN
-
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+# run SFT and eval the model
+python -m scripts.chat_sft -- --device-batch-size=32 --total-batch-size=32768 --run=$WANDB_RUN
+python -m scripts.chat_eval -- -i sft
 
 # -----------------------------------------------------------------------------
 # Report

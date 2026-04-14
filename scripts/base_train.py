@@ -46,7 +46,8 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
-parser.add_argument("--fp4", action="store_true", help="enable FP4 training (requires Blackwell SM100+ GPU)")
+parser.add_argument("--fp4", action="store_true", help="enable FP4 training via TransformerEngine (requires Blackwell SM100+ GPU)")
+parser.add_argument("--mxfp8", action="store_true", help="enable MXFP8 block-scaled training via TransformerEngine (requires Blackwell SM100+ GPU)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -79,8 +80,8 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
-if args.fp8 and args.fp4:
-    parser.error("--fp8 and --fp4 are mutually exclusive (both replace nn.Linear)")
+if sum([args.fp8, args.fp4, args.mxfp8]) > 1:
+    parser.error("--fp8, --fp4, and --mxfp8 are mutually exclusive (all replace nn.Linear)")
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -169,21 +170,15 @@ if resuming:
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
 
-# Convert Linear layers to Float8Linear if --fp8 is set
-if args.fp8 or args.fp4:
+# Convert Linear layers to reduced precision if requested
+use_te = args.fp4 or args.mxfp8  # TransformerEngine recipes (NVFP4, MXFP8)
+if args.fp8 or use_te:
     if device_type != "cuda":
-        print0("Warning: FP8/FP4 training requires CUDA, ignoring --fp8 flag")
+        print0("Warning: Reduced precision training requires CUDA, ignoring flag")
     else:
-        # our custom fp8 is simpler than torchao, written for exact API compatibility
-        if args.fp8:
-            from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
-        if args.fp4:
-            from nanochat.fp4 import convert_to_float4_training, get_nvfp4_recipe
-            import transformer_engine.pytorch as te
-        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
         import torch.nn as nn
 
-        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
+        # Filter: dims must be divisible by 16 and large enough
         def quantize_module_filter(mod: nn.Module, fqn: str) -> bool:
             if not isinstance(mod, nn.Linear):
                 return False
@@ -193,32 +188,37 @@ if args.fp8 or args.fp4:
                 return False
             return True
 
-
         num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
+
         if args.fp8:
+            # Custom FP8 (tensorwise scaling, no TransformerEngine dependency)
+            from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
             fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
             convert_to_float8_training(model, config=fp8_config, module_filter_fn=quantize_module_filter)
             num_quant = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-        elif args.fp4:
+            quant_label = f"FP8 ({args.fp8_recipe} scaling)"
+        else:
+            # TransformerEngine recipes (NVFP4 or MXFP8)
+            from nanochat.fp4 import convert_to_float4_training
+            import transformer_engine.pytorch as te
             convert_to_float4_training(model, module_filter_fn=quantize_module_filter)
             num_quant = sum(1 for m in model.modules() if isinstance(m, te.Linear))
-
+            quant_label = "FP4 (NVFP4 via TransformerEngine)" if args.fp4 else "MXFP8 (block scaling via TransformerEngine)"
 
         num_skipped = num_linear - num_quant
-
-        quant_label = f"FP8 ({args.fp8_recipe} scaling)" if args.fp8 else "FP4 (NVFP4 via TransformerEngine)"
         print0(f"✓ {quant_label} training enabled - converted {num_quant}/{num_linear} linear layers, skipped {num_skipped} (too small)")
 
-# Initialize NVFP4 autocast context for training loop
-# When fp4 is active, fp4_autocast wraps forward pass to enable NVFP4 on te.Linear layers
-# When fp4 is inactive, fp4_autocast is just nullcontext (no-op)
-if args.fp4:
-    from nanochat.fp4 import get_nvfp4_recipe
-    _nvfp4_recipe = get_nvfp4_recipe()
-    def fp4_autocast():
-        return te.autocast(recipe=_nvfp4_recipe)
+# Initialize TransformerEngine autocast context for training loop
+# Wraps forward pass to enable NVFP4/MXFP8 on te.Linear layers; no-op otherwise
+if use_te:
+    from nanochat.fp4 import get_te_recipe
+    import transformer_engine.pytorch as te
+    _te_recipe_name = "nvfp4" if args.fp4 else "mxfp8"
+    _te_recipe = get_te_recipe(_te_recipe_name)
+    def te_autocast():
+        return te.autocast(recipe=_te_recipe)
 else:
-    fp4_autocast = nullcontext
+    te_autocast = nullcontext
 
 # Context manager to temporarily disable FP8/FP4 so that model evaluation remains in BF16
 @contextmanager
@@ -547,8 +547,8 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        # fp4_autocast enables NVFP4 for te.Linear layers; no-op when not using FP4
-        with fp4_autocast():
+        # te_autocast enables NVFP4/MXFP8 for te.Linear layers; no-op when not using TE
+        with te_autocast():
             loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
