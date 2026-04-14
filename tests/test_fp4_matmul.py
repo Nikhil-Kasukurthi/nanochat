@@ -5,9 +5,13 @@ Run on B200:
 """
 import torch
 
+
 def test_fp4_matmul():
     """Compare FP4 matmul output vs bf16 reference. Should be close, not NaN."""
-    from nanochat.fp4 import _to_nvfp4, _to_blocked_scales, BLOCK_SIZE
+    from nanochat.fp4 import (
+        _to_nvfp4, _to_blocked_scales, _per_tensor_amax_to_scale,
+        BLOCK_SIZE, FP8_E4M3_MAX, FP4_E2M1_MAX,
+    )
 
     torch.manual_seed(42)
     M, K, N = 256, 1024, 512
@@ -18,24 +22,20 @@ def test_fp4_matmul():
     # Reference: bf16 matmul
     ref_output = input_2d @ weight.t()
 
-    # FP4 path: quantize (returns uint8 packed + FP8 block scales)
-    in_packed, in_bscales = _to_nvfp4(input_2d)
-    w_packed, w_bscales = _to_nvfp4(weight)
+    # Two-level scaling (matches what _Float4Matmul.forward does)
+    in_pts = _per_tensor_amax_to_scale(input_2d.abs().amax())
+    w_pts = _per_tensor_amax_to_scale(weight.abs().amax())
+
+    in_packed, in_bscales = _to_nvfp4(input_2d, per_tensor_scale=in_pts)
+    w_packed, w_bscales = _to_nvfp4(weight, per_tensor_scale=w_pts)
 
     print(f"in_packed dtype: {in_packed.dtype}, shape: {in_packed.shape}")
     print(f"in_bscales dtype: {in_bscales.dtype}, shape: {in_bscales.shape}")
-    print(f"w_packed dtype: {w_packed.dtype}, shape: {w_packed.shape}")
-    print(f"w_bscales dtype: {w_bscales.dtype}, shape: {w_bscales.shape}")
-
-    # Check for NaN in scales
-    print(f"in_bscales has NaN: {in_bscales.to(torch.float32).isnan().any()}")
-    print(f"w_bscales has NaN: {w_bscales.to(torch.float32).isnan().any()}")
+    print(f"per_tensor_scales: in={in_pts.item():.6f}, w={w_pts.item():.6f}")
 
     # Blocked scales
     in_blocked = _to_blocked_scales(in_bscales, M, K // BLOCK_SIZE)
     w_blocked = _to_blocked_scales(w_bscales, N, K // BLOCK_SIZE)
-    print(f"in_blocked numel: {in_blocked.numel()}")
-    print(f"w_blocked numel: {w_blocked.numel()}")
 
     # FP4 matmul via _scaled_mm
     output = torch._scaled_mm(
@@ -46,6 +46,9 @@ def test_fp4_matmul():
         out_dtype=torch.bfloat16,
         use_fast_accum=False,
     )
+
+    # Apply per-tensor scales
+    output = output * (in_pts * w_pts).to(torch.bfloat16)
 
     print(f"\nOutput shape: {output.shape}")
     print(f"Output has NaN: {output.isnan().any()}")
@@ -64,14 +67,16 @@ def test_fp4_matmul():
 
 def test_fp4_dequant_roundtrip():
     """Check that quantize -> dequantize approximately recovers original values."""
-    from nanochat.fp4 import _to_nvfp4, _dequantize_nvfp4
+    from nanochat.fp4 import _to_nvfp4, _dequantize_nvfp4, _per_tensor_amax_to_scale
 
     torch.manual_seed(42)
     M, K = 64, 256
     x = torch.randn(M, K, device='cuda', dtype=torch.bfloat16)
 
-    fp4_packed, bscales = _to_nvfp4(x)
-    x_recovered = _dequantize_nvfp4(fp4_packed, bscales, torch.bfloat16)
+    # Test with two-level scaling
+    pts = _per_tensor_amax_to_scale(x.abs().amax())
+    fp4_packed, bscales = _to_nvfp4(x, per_tensor_scale=pts)
+    x_recovered = _dequantize_nvfp4(fp4_packed, bscales, torch.bfloat16, per_tensor_scale=pts)
 
     print(f"\nRoundtrip test (M={M}, K={K}):")
     print(f"Original range:  [{x.min():.4f}, {x.max():.4f}]")

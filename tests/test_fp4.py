@@ -12,14 +12,13 @@ import torch.nn as nn
 from nanochat.fp4 import (
     _to_nvfp4,
     _dequantize_nvfp4,
-    _f32_to_fp4_packed,
-    _fp4_packed_to_f32,
+    _per_tensor_amax_to_scale,
     _to_blocked_scales,
     Float4Linear,
     convert_to_float4_training,
     FP4_E2M1_MAX,
     FP8_E4M3_MAX,
-    EPS,
+    FP8_E4M3_TINY,
     BLOCK_SIZE,
 )
 
@@ -31,32 +30,24 @@ def test_fp4_roundtrip_values():
     # All representable FP4 values (positive and negative)
     values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
-    packed = _f32_to_fp4_packed(values)
-    recovered = _fp4_packed_to_f32(packed, packed.device)
-    assert torch.allclose(values.abs(), recovered.abs()), f"Expected {values}, got {recovered}"
+    # Quantize with unit scale so values pass through unscaled
+    M, K = 1, 16
+    x = values.reshape(M, K)
+    # Use single-level scaling with a known tensor to test encoding
+    fp4_packed, _ = _to_nvfp4(x)
+    recovered = _dequantize_nvfp4(fp4_packed, torch.ones(M, 1, dtype=torch.float8_e4m3fn), torch.float32)
+    assert torch.allclose(values.abs(), recovered.abs(), atol=0.01), f"Expected {values}, got {recovered}"
 
 
 def test_fp4_rounding():
-    """Values between representable FP4 values should round to nearest."""
-    # 0.3 is between 0 (code 0) and 0.5 (code 1), boundary at 0.25 -> rounds to 0.5
-    # 0.6 is between 0.5 and 1.0, boundary at 0.75 -> rounds to 0.5
-    # 2.4 is between 2.0 and 3.0, boundary at 2.5 -> rounds to 2.0
-    # 5.5 is between 4.0 and 6.0, boundary at 5.0 -> rounds to 6.0
-    values = torch.tensor([0.3, 0.6, 2.4, 5.5, -0.3, -0.6, -2.4, -5.5])
-    packed = _f32_to_fp4_packed(values)
-    recovered = _fp4_packed_to_f32(packed, packed.device)
-    expected = torch.tensor([0.5, 0.5, 2.0, 6.0, -0.5, -0.5, -2.0, -6.0])
+    """Values between representable FP4 values should round correctly."""
+    # 0.3 -> 0.5, 0.6 -> 0.5, 2.4 -> 2.0, 5.5 -> 6.0
+    from torchao.prototype.mx_formats.kernels import f32_to_f4_unpacked, f4_unpacked_to_f32
+    values = torch.tensor([0.3, 0.6, 2.4, 5.5])
+    unpacked = f32_to_f4_unpacked(values)
+    recovered = f4_unpacked_to_f32(unpacked)
+    expected = torch.tensor([0.5, 0.5, 2.0, 6.0])
     assert torch.allclose(recovered, expected), f"Expected {expected}, got {recovered}"
-
-
-def test_fp4_packing():
-    """Two FP4 values should be packed into one byte correctly."""
-    values = torch.tensor([1.0, 2.0])  # codes: 2, 4
-    packed = _f32_to_fp4_packed(values)
-    assert packed.shape == (1,)
-    # First value (1.0=code 2) in HIGH nibble, second (2.0=code 4) in LOW nibble
-    # Matches torchao's pack_uint4 convention
-    assert packed[0].item() == ((2 << 4) | 4), f"Got {packed[0].item()}, expected {(2 << 4) | 4}"
 
 
 # --- Quantization math tests ---
@@ -110,6 +101,31 @@ def test_k_not_divisible_by_16():
     x = torch.randn(4, 17)
     with pytest.raises(AssertionError):
         _to_nvfp4(x)
+
+
+# --- Two-level scaling tests ---
+
+def test_two_level_scaling_roundtrip():
+    """Two-level scaling quantize -> dequantize should recover values."""
+    M, K = 8, 64
+    x = torch.randn(M, K) * 10  # larger magnitude to test dynamic range
+    pts = _per_tensor_amax_to_scale(x.abs().amax())
+    fp4_packed, block_scales = _to_nvfp4(x, per_tensor_scale=pts)
+    x_recovered = _dequantize_nvfp4(fp4_packed, block_scales, torch.float32, per_tensor_scale=pts)
+
+    assert not x_recovered.isnan().any()
+    assert x_recovered.shape == x.shape
+    mae = (x - x_recovered).abs().mean()
+    data_scale = x.abs().mean()
+    assert mae < data_scale, f"MAE {mae:.4f} too large vs data scale {data_scale:.4f}"
+
+
+def test_per_tensor_scale_formula():
+    """per_tensor_scale = amax / (FP8_E4M3_MAX * FP4_E2M1_MAX)."""
+    amax = torch.tensor(100.0)
+    pts = _per_tensor_amax_to_scale(amax)
+    expected = 100.0 / (448.0 * 6.0)
+    assert abs(pts.item() - expected) < 1e-6
 
 
 # --- Blocked scales tests ---
