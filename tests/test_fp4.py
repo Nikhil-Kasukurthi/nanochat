@@ -41,12 +41,12 @@ def test_fp4_roundtrip_values():
 
 def test_fp4_rounding():
     """Values between representable FP4 values should round correctly."""
+    from nanochat.fp4 import _f32_to_fp4_packed, _fp4_packed_to_f32
     # 0.3 -> 0.5, 0.6 -> 0.5, 2.4 -> 2.0, 5.5 -> 6.0
-    from torchao.prototype.mx_formats.kernels import f32_to_f4_unpacked, f4_unpacked_to_f32
-    values = torch.tensor([0.3, 0.6, 2.4, 5.5])
-    unpacked = f32_to_f4_unpacked(values)
-    recovered = f4_unpacked_to_f32(unpacked)
-    expected = torch.tensor([0.5, 0.5, 2.0, 6.0])
+    values = torch.tensor([0.3, 0.6, 2.4, 5.5, -0.3, -0.6, -2.4, -5.5])
+    packed = _f32_to_fp4_packed(values)
+    recovered = _fp4_packed_to_f32(packed, packed.device)
+    expected = torch.tensor([0.5, 0.5, 2.0, 6.0, -0.5, -0.5, -2.0, -6.0])
     assert torch.allclose(recovered, expected), f"Expected {expected}, got {recovered}"
 
 

@@ -17,17 +17,14 @@ The matmul path is:
   3. Multiply output by per-tensor scale product
 
 Backward pass uses fake quantization: dequantize to bf16 for gradient matmuls.
-FP4 encoding uses torchao's IEEE round-to-nearest-even bit manipulation.
+FP4 encoding uses IEEE round-to-nearest-even bit manipulation (inlined from
+torchao/prototype/custom_fp_utils.py, specialized for e2m1).
 
 Reference: pytorch/ao torchao/prototype/mx_formats/nvfp4_tensor.py
 """
 
 import torch
 import torch.nn as nn
-
-from torchao.prototype.mx_formats.kernels import (
-    f32_to_f4_unpacked, f4_unpacked_to_f32, pack_uint4, unpack_uint4,
-)
 
 from nanochat.common import COMPUTE_DTYPE
 
@@ -37,6 +34,93 @@ FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 # Smallest normal FP8 e4m3 value (~1.53e-05). Using 1e-12 is wrong because
 # values below tiny flush to zero when cast to FP8, causing inf on reciprocal.
 FP8_E4M3_TINY = torch.finfo(torch.float8_e4m3fn).tiny
+
+# --- FP4 e2m1 encoding/decoding (inlined from torchao) -----------------------
+#
+# FP4 e2m1 bit layout: [sign(1) | exponent(2) | mantissa(1)] stored in bits 0-3
+# of a uint8. The 8 representable magnitudes map to codes 0-7:
+#   code 0=0.0, 1=0.5(denormal), 2=1.0, 3=1.5, 4=2.0, 5=3.0, 6=4.0, 7=6.0
+#
+# Encoding uses IEEE-style bit manipulation with round-to-nearest-even, matching
+# hardware behavior. Decoding uses a fast lookup table (only 16 possible codes).
+#
+# Reference: torchao/prototype/custom_fp_utils.py (_f32_to_floatx_unpacked)
+
+# Pre-computed constants for FP4 e2m1 encoding
+_FP4_EXP_BIAS = 1                # 2^(ebits-1) - 1 = 2^1 - 1 = 1
+_FP4_MAX_INT = 7                  # 2^(ebits+mbits) - 1 = 2^3 - 1
+_FP4_SIGN_MASK = 8                # 1 << (ebits+mbits) = 1 << 3
+_FP4_MAX_NORMAL = 6.0             # 2^(3-1) * (3/2) = 6.0
+_FP4_MIN_NORMAL = 1.0             # 2^(1-1) = 1.0
+_FP4_MAGIC_ADDER = 0x1FFFFF       # (1 << 21) - 1, for round-to-nearest-even
+# For denormal conversion: (F32_bias - FP4_bias + F32_mantissa - FP4_mantissa + 1) << 23
+_FP4_DENORM_MASK_INT = 149 << 23  # (127 - 1 + 23 - 1 + 1) << 23
+_FP4_DENORM_MASK_FLOAT = torch.tensor(_FP4_DENORM_MASK_INT, dtype=torch.int32).view(torch.float32)
+# For normal encoding: (FP4_bias - F32_bias) << 23 + magic_adder
+_FP4_NORMAL_ADJUST = ((_FP4_EXP_BIAS - 127) << 23) + _FP4_MAGIC_ADDER
+
+# Lookup table for decoding: FP4 code (0-15, with sign in bit 3) -> float32
+# Positive: 0=0.0, 1=0.5, 2=1.0, 3=1.5, 4=2.0, 5=3.0, 6=4.0, 7=6.0
+# Negative (bit 3 set): 8=-0.0, 9=-0.5, 10=-1.0, ... 15=-6.0
+_FP4_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
+
+def _f32_to_fp4_packed(x_flat):
+    """Convert float32 to packed FP4 e2m1 uint8 using IEEE round-to-nearest-even.
+
+    Args:
+        x_flat: 1D float tensor (even length), values in [-6.0, 6.0].
+    Returns:
+        uint8 tensor with half the elements (two FP4 values per byte).
+    """
+    x = x_flat.float()
+    # Extract and remove sign
+    x_int = x.view(torch.int32)
+    sign = x_int & 0x80000000
+    x = (x_int ^ sign).view(torch.float32)
+
+    # Three branches: saturate, denormal, normal
+    saturate_mask = x >= _FP4_MAX_NORMAL
+    denormal_mask = (~saturate_mask) & (x < _FP4_MIN_NORMAL)
+    normal_mask = ~(saturate_mask | denormal_mask)
+
+    # Denormal path: add magic float, subtract magic int, truncate to uint8
+    # This trick converts small floats to the correct denormal code via FP addition
+    denormal_x = (x + _FP4_DENORM_MASK_FLOAT.to(x.device)).view(torch.int32) - _FP4_DENORM_MASK_INT
+    denormal_x = denormal_x.to(torch.uint8)
+
+    # Normal path: adjust exponent bias + round-to-nearest-even via magic adder
+    normal_x = x.view(torch.int32)
+    mant_odd = (normal_x >> 22) & 1  # bit 22 = LSB of mantissa we keep
+    normal_x = ((normal_x + _FP4_NORMAL_ADJUST + mant_odd) >> 22).to(torch.uint8)
+
+    # Combine: saturated -> max code (7), denormal -> computed, normal -> computed
+    result = torch.full_like(x, _FP4_MAX_INT, dtype=torch.uint8)
+    result = torch.where(denormal_mask, denormal_x, result)
+    result = torch.where(normal_mask, normal_x, result)
+
+    # Add sign bit (bit 3 of FP4)
+    sign_lp = (sign >> 28).to(torch.uint8) & _FP4_SIGN_MASK
+    nibble = result | sign_lp
+
+    # Pack pairs: first value in LOW nibble, second in HIGH nibble
+    return (nibble[0::2] & 0xF) | ((nibble[1::2] & 0xF) << 4)
+
+
+def _fp4_packed_to_f32(packed, device):
+    """Unpack packed FP4 uint8 to float32 via lookup table.
+
+    Args:
+        packed: uint8 tensor with two FP4 values per byte.
+        device: target device.
+    Returns:
+        float32 tensor with twice the elements.
+    """
+    lut = torch.tensor(_FP4_LUT, dtype=torch.float32, device=device)
+    first = packed & 0x0F
+    second = (packed >> 4) & 0x0F
+    return torch.stack([lut[first.long()], lut[second.long()]], dim=-1).view(-1)
 
 
 def _per_tensor_amax_to_scale(amax):
@@ -96,7 +180,7 @@ def _to_nvfp4(x, per_tensor_scale=None):
     x_scaled = x_scaled.clamp(-FP4_E2M1_MAX, FP4_E2M1_MAX)
 
     # Encode to packed uint8 using IEEE round-to-nearest-even (two FP4 values per byte)
-    fp4_packed = pack_uint4(f32_to_f4_unpacked(x_scaled.reshape(M, K)))
+    fp4_packed = _f32_to_fp4_packed(x_scaled.reshape(-1))
     fp4_packed = fp4_packed.reshape(M, K // 2)
 
     return fp4_packed, block_scales_fp8
@@ -106,14 +190,9 @@ def _to_blocked_scales(scales, M, num_blocks):
     """Rearrange block scales into the swizzled (blocked) layout cuBLAS expects.
 
     cuBLAS NVFP4 kernels read scales in a specific tiled order. This function
-    rearranges (M, num_blocks) scales into that layout.
+    pads to (128, 4) tiles and rearranges into 32x16 blocks.
 
-    The packed FP4 format (float4_e2m1fn_x2) halves the K dimension, so cuBLAS
-    sees K_packed = K//2. It expects scales for K_packed/16 = K/32 blocks, but
-    we computed K/16 blocks. Each scale must be duplicated to cover both halves
-    of a packed block.
-
-    Reference: torchao.prototype.mx_formats.utils.to_blocked()
+    Reference: https://docs.nvidia.com/cuda/cublas/index.html#d-block-scaling-factors-layout
 
     Args:
         scales: block scales of shape (M, num_blocks) in float8_e4m3fn
@@ -123,9 +202,15 @@ def _to_blocked_scales(scales, M, num_blocks):
     Returns:
         Scales in swizzled blocked layout, flattened to 1D.
     """
-    # Use torchao's swizzle which pads to (128, 4) tiles and rearranges
-    from torchao.prototype.mx_formats.utils import to_blocked
-    return to_blocked(scales)
+    rows, cols = scales.shape
+    nr = (rows + 127) // 128
+    nc = (cols + 3) // 4
+    # Pad to tile boundaries (128 rows, 4 cols)
+    padded = torch.zeros(nr * 128, nc * 4, device=scales.device, dtype=scales.dtype)
+    padded[:rows, :cols] = scales
+    # Rearrange: split into 128x4 blocks, then subdivide into 32x4 sub-blocks
+    blocks = padded.view(nr, 128, nc, 4).permute(0, 2, 1, 3)
+    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
 
 
 @torch.no_grad()
@@ -140,8 +225,8 @@ def _dequantize_nvfp4(fp4_packed, block_scales_fp8, orig_dtype, per_tensor_scale
     K = K_half * 2  # logical K
     num_blocks = K // BLOCK_SIZE
 
-    # Unpack FP4 to float32 using torchao's IEEE-correct conversion
-    data_f32 = f4_unpacked_to_f32(unpack_uint4(fp4_packed.reshape(-1)))
+    # Unpack FP4 to float32 via lookup table
+    data_f32 = _fp4_packed_to_f32(fp4_packed.reshape(-1), fp4_packed.device)
     data_f32 = data_f32.reshape(M, num_blocks, BLOCK_SIZE)
 
     # Multiply by block scales to recover original magnitude
