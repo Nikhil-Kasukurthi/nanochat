@@ -254,16 +254,21 @@ def disable_fp8(model):
     # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype)
     # Use device="meta" to avoid VRAM spike - the weight tensor will be swapped in afterwards
     for parent, attr_name, fp8_module in fp8_locations:
+        has_bias = fp8_module.bias is not None and not fp8_module.bias.is_meta
         linear = Linear(
             fp8_module.in_features,
             fp8_module.out_features,
-            bias=fp8_module.bias is not None,
+            bias=has_bias,
             device="meta",  # Use meta device to avoid unnecessary VRAM allocation
             dtype=fp8_module.weight.dtype,
         )
         linear.weight = fp8_module.weight  # share, don't copy
-        if fp8_module.bias is not None:
-            linear.bias = fp8_module.bias
+        if has_bias:
+            # te.Linear may store bias as a plain tensor, not nn.Parameter
+            bias = fp8_module.bias
+            if not isinstance(bias, nn.Parameter):
+                bias = nn.Parameter(bias)
+            linear.bias = bias
         setattr(parent, attr_name, linear)
 
     try:

@@ -17,6 +17,7 @@ Requirements:
 Reference: https://developer.nvidia.com/blog/using-nvfp4-low-precision-model-training-for-higher-throughput-without-losing-accuracy
 """
 
+import torch
 import torch.nn as nn
 
 import transformer_engine.pytorch as te
@@ -47,18 +48,20 @@ def convert_to_float4_training(module, *, module_filter_fn=None):
             _convert(child, fqn)
             if isinstance(child, nn.Linear) and not isinstance(child, te.Linear):
                 if module_filter_fn is None or module_filter_fn(child, fqn):
-                    # Create te.Linear sharing the same weight
+                    # Create te.Linear with bf16 params (te handles mixed precision internally).
+                    # nanochat's Linear keeps fp32 master weights, but te.Linear expects
+                    # params_dtype to match input dtype. Copy weight to bf16 — the optimizer
+                    # will maintain fp32 master weights in its state dict.
                     te_linear = te.Linear(
                         child.in_features,
                         child.out_features,
                         bias=child.bias is not None,
-                        params_dtype=child.weight.dtype,
-                        device="meta",  # avoid VRAM spike
+                        params_dtype=torch.bfloat16,
+                        device=child.weight.device if not child.weight.is_meta else "meta",
                     )
-                    # Share weight and bias tensors (no copies)
-                    te_linear.weight = child.weight
+                    te_linear.weight.data = child.weight.data.to(torch.bfloat16)
                     if child.bias is not None:
-                        te_linear.bias = child.bias
+                        te_linear.bias.data = child.bias.data.to(torch.bfloat16)
                     setattr(mod, name, te_linear)
 
     _convert(module)

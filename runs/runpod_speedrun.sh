@@ -1,108 +1,68 @@
 #!/bin/bash
 set -e
 
-# RunPod variant of speedrun.sh — trains a d16 LLM (pretraining + finetuning)
-# on a single H100 NVL GPU. Takes approximately 1-2 hours to complete.
+# Train a nanochat LLM on 8xB200 GPUs with NVFP4 precision.
+# Uses TransformerEngine for FP4 and Flash Attention 4 for Blackwell.
 #
-# RunPod-specific fixes:
-# - Adds ~/.local/bin to PATH (where uv installs on RunPod)
-# - Sources uv env file for proper shell integration
-# - Installs python3-dev (needed for torchao FP8 JIT CUDA compilation)
-# - Installs vim/tmux for convenience during long training runs
-# GPU notes:
-# - FP8 training enabled by default for ~10-20% speedup (H100+)
-# - FP4 training available on Blackwell SM100+ (B100/B200) via PRECISION=fp4
-# - FA3 available, uses default SSSL sliding window pattern
+# Example launch:
+#   screen -L -Logfile speedrun.log -S speedrun bash runs/runpod_speedrun.sh
+# With wandb:
+#   WANDB_RUN=d24 screen -L -Logfile speedrun.log -S speedrun bash runs/runpod_speedrun.sh
 
-# 1) Example launch (simplest):
-# bash runs/runpod_speedrun.sh
-# 2) Example launch in a screen session (because the run takes ~1-2 hours):
-# screen -L -Logfile runs/runpod_speedrun.log -S speedrun bash runs/runpod_speedrun.sh
-# 3) Example launch with wandb logging, but see below for setting up wandb first:
-# WANDB_RUN=speedrun screen -L -Logfile runs/runpod_speedrun.log -S speedrun bash runs/runpod_speedrun.sh
-
-# Default intermediate artifacts directory is in ~/.cache/nanochat
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="/workspace/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
 # -----------------------------------------------------------------------------
-# RunPod system dependencies
-# python3-dev: needed for torchao's FP8 CUDA extension JIT compilation (Python.h)
-# vim/tmux: useful for inspecting logs and running sessions during long training runs
+# System dependencies
 apt-get update -qq && apt-get install -y -qq python3-dev vim tmux 2>/dev/null
 
 # -----------------------------------------------------------------------------
-# Python venv setup with uv
+# Python venv + dependencies
 
-# install uv (if not already installed), then source its env for proper shell integration
 if ! command -v uv &> /dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
     source $HOME/.local/bin/env
 fi
-# ensure ~/.local/bin is on PATH
 export PATH="$HOME/.local/bin:$PATH"
-# create a .venv local virtual environment (if it doesn't exist)
+
 [ -d ".venv" ] || uv venv
-# install the repo dependencies
 uv sync --extra gpu
-# activate venv so that `python` uses the project's venv instead of system python
 source .venv/bin/activate
-# install flash-attn-4 for Blackwell GPUs (FA4 requires CuTe DSL, compiles in ~3-5 min)
-if [ "$PRECISION" = "fp4" ]; then
-    echo "Installing TransformerEngine for NVFP4 training on Blackwell..."
+
+# TransformerEngine for NVFP4 training
+# Building from source needs CUDA headers — nvidia pip packages have them but not on default paths.
+# LD_LIBRARY_PATH is needed at runtime for libcublas/libcudnn.
+echo "Installing TransformerEngine for NVFP4 training..."
+NVIDIA_DIRS=$(find .venv/lib/python*/site-packages/nvidia /venv/main/lib/python*/site-packages/nvidia -maxdepth 2 \( -name 'include' -o -name 'lib' \) -type d 2>/dev/null)
+NVIDIA_INCLUDES=$(echo "$NVIDIA_DIRS" | grep include | tr '\n' ':')
+NVIDIA_LIBS=$(echo "$NVIDIA_DIRS" | grep '/lib$' | tr '\n' ':')
+CPATH="${NVIDIA_INCLUDES}${CPATH}" LIBRARY_PATH="${NVIDIA_LIBS}${LIBRARY_PATH}" \
     uv pip install --no-build-isolation "transformer_engine[pytorch]"
-    echo "Installing flash-attn-4 for Blackwell (this takes a few minutes to compile)..."
-    uv pip install "flash-attn-4[cu13]" --prerelease=allow
-    # Pin cutlass-dsl to stable release — the dev version (4.5.0.dev0) has a packaging
-    # bug where a _cutlass_ir/ stub directory shadows the _cutlass_ir.so extension module
-    uv pip install "nvidia-cutlass-dsl==4.4.2" "nvidia-cutlass-dsl-libs-base==4.4.2" "nvidia-cutlass-dsl-libs-cu13==4.4.2"
-fi
+# Set runtime library path (re-scan after install since TE may add nvidia packages)
+NVIDIA_LIBS=$(find .venv/lib/python*/site-packages/nvidia /venv/main/lib/python*/site-packages/nvidia -maxdepth 2 -name 'lib' -type d 2>/dev/null | tr '\n' ':')
+export LD_LIBRARY_PATH="${NVIDIA_LIBS}${LD_LIBRARY_PATH}"
+
+# Flash Attention 4 for Blackwell
+echo "Installing flash-attn-4 for Blackwell..."
+uv pip install "flash-attn-4[cu13]" --prerelease=allow
+uv pip install "nvidia-cutlass-dsl==4.4.2" "nvidia-cutlass-dsl-libs-base==4.4.2" "nvidia-cutlass-dsl-libs-cu13==4.4.2"
 
 # -----------------------------------------------------------------------------
-# wandb setup
-# If you wish to use wandb for logging (it's nice!, recommended).
-# 1) Make sure to first log in to wandb, e.g. run:
-#    `wandb login`
-# 2) Set the WANDB_RUN environment variable when running this script, e.g.:
-#    `WANDB_RUN=d26 bash runs/runpod_speedrun.sh`
-if [ -z "$WANDB_RUN" ]; then
-    # by default use "dummy" : it's handled as a special case, skips logging to wandb
-    WANDB_RUN=dummy
-fi
-
-# Precision: fp8 (default, H100+) or fp4 (Blackwell SM100+ only)
-# Override with: PRECISION=fp4 bash runs/runpod_speedrun.sh
-PRECISION=${PRECISION:-fp8}
-if [ "$PRECISION" != "fp8" ] && [ "$PRECISION" != "fp4" ]; then
-    echo "Error: PRECISION must be 'fp8' or 'fp4', got '$PRECISION'"
-    exit 1
-fi
-PRECISION_FLAG="--${PRECISION}"
+# wandb (optional)
+WANDB_RUN=${WANDB_RUN:-dummy}
 
 # -----------------------------------------------------------------------------
-# During the course of the run, we will be writing markdown reports to the report/
-# directory in the base dir. This command clears it out and writes a header section
-# with a bunch of system info and a timestamp that marks the start of the run.
+# Report header
 python -m nanochat.report reset
 
 # -----------------------------------------------------------------------------
 # Tokenizer
 
-# Download the first ~2B characters of pretraining dataset
-# each data shard is ~250M chars
-# so we download 2e9 / 250e6 = 8 data shards at this point
-# each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
-# look at dev/repackage_data_reference.py for details on how this data was prepared
 python -m nanochat.dataset -n 8
-# Immediately also kick off downloading more shards in the background while tokenizer trains
-# Approximately 350 shards are needed for 10B tokens of data for pretraining.
-# The maximum total number of shards available in the entire dataset is 1822.
-python -m nanochat.dataset -n 100 &
+python -m nanochat.dataset -n 350 &
 DATASET_DOWNLOAD_PID=$!
-# train the tokenizer with vocab size 2**15 = 32768 on ~2B characters of data
 python -m scripts.tok_train
-# evaluate the tokenizer (report compression ratio etc.)
 python -m scripts.tok_eval
 
 # -----------------------------------------------------------------------------
@@ -110,29 +70,32 @@ python -m scripts.tok_eval
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
-# d16 model on single GPU with reduced precision training (FP8 on H100+, FP4 on Blackwell)
-python -m scripts.base_train --depth=24 --target-param-data-ratio=10 --device-batch-size=64 --total-batch-size=131072 --run=$WANDB_RUN --save-every=1000 --eval-every=500 --model-tag=d24 --fp4
-# evaluate the model: CORE metric, BPB on train/val, and draw samples
-python -m scripts.base_eval --device-batch-size=32
+# d24 model on 8xB200 with NVFP4
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+    --depth=24 \
+    --target-param-data-ratio=10 \
+    --device-batch-size=32 \
+    --fp4 \
+    --run=$WANDB_RUN \
+    --save-every=1000 \
+    --eval-every=500
+
+# Evaluate
+python -m scripts.base_eval --device-batch-size=16
 
 # -----------------------------------------------------------------------------
-# SFT (teach the model conversation special tokens, tool use, multiple choice)
+# SFT
 
-# download 2.3MB of synthetic identity conversations to impart a personality to nanochat
-# see dev/gen_synthetic_data.py for details on how this data was prepared and to get a sense of how you can easily tune it
-curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl \
+    https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
-# run SFT and eval the model
-python -m scripts.chat_sft --device-batch-size=32 --total-batch-size=32768 --run=$WANDB_RUN
-python -m scripts.chat_eval -- -i sft
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- \
+    --device-batch-size=32 \
+    --total-batch-size=32768 \
+    --run=$WANDB_RUN
 
-# chat with the model over CLI! Leave out the -p to chat interactively
-# python -m scripts.chat_cli -p "Why is the sky blue?"
-
-# even better, chat with your model over a pretty WebUI ChatGPT style
-# python -m scripts.chat_web
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
 
 # -----------------------------------------------------------------------------
-# Generate the full report by putting together all the sections
-# report.md is the output and will be copied to current directory for convenience
+# Report
 python -m nanochat.report generate
