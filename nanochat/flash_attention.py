@@ -86,8 +86,11 @@ USE_FA4 = _IMPL == 'fa4'
 USE_FA3 = _IMPL == 'fa3'
 
 
+@torch.compiler.disable
 def _call_fa4(q, k, v, causal, window_size):
-    out = _fa4_func(q, k, v, causal=causal, window_size=window_size)
+    # FA4 uses (None, None) for unlimited context, not (-1, -1) like FA3
+    ws = tuple(None if w == -1 else w for w in window_size)
+    out = _fa4_func(q, k, v, causal=causal, window_size=ws)
     return out[0] if isinstance(out, tuple) else out
 
 
