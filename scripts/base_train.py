@@ -32,7 +32,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
-from nanochat.flash_attention import HAS_FA3, HAS_FA4, USE_FA4
+from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -106,17 +106,15 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
 using_fa3 = USE_FA3
-if USE_FA4:
-    print0("✓ Using Flash Attention 4 (Blackwell GPU detected), efficient, new and awesome.")
-elif using_fa3:
+if using_fa3:
     print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
 else:
     print0("!" * 80)
-    if (HAS_FA3 or HAS_FA4) and COMPUTE_DTYPE != torch.bfloat16:
+    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
         print0(f"WARNING: Flash Attention only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
     else:
-        print0("WARNING: Flash Attention 3/4 not available, using PyTorch SDPA fallback")
-    print0("WARNING: Training will be less efficient without FA3/FA4")
+        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
+    print0("WARNING: Training will be less efficient without FA3")
     if args.window_pattern != "L":
         print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
