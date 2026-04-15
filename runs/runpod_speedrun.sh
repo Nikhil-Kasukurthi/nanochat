@@ -73,6 +73,7 @@ wait $DATASET_DOWNLOAD_PID
 
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp4 --run=$WANDB_RUN
+python -m scripts.base_train --depth=24 --target-param-data-ratio=8 --device-batch-size=64 --fp8 --window_pattern L
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
 python -m scripts.base_eval --device-batch-size=16
 
