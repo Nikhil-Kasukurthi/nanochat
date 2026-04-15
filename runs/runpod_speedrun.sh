@@ -32,7 +32,8 @@ source .venv/bin/activate
 
 # TransformerEngine for NVFP4 training
 # Building from source needs CUDA headers — nvidia pip packages have them but not on default paths.
-# LD_LIBRARY_PATH is needed at runtime for libcublas/libcudnn.
+# LD_LIBRARY_PATH is needed at runtime for libcublas/libcudnn.]
+uv pip install -U torch
 echo "Installing TransformerEngine for NVFP4 training..."
 NVIDIA_DIRS=$(find .venv/lib/python*/site-packages/nvidia /venv/main/lib/python*/site-packages/nvidia -maxdepth 2 \( -name 'include' -o -name 'lib' \) -type d 2>/dev/null)
 NVIDIA_INCLUDES=$(echo "$NVIDIA_DIRS" | grep include | tr '\n' ':')
