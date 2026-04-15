@@ -1,8 +1,7 @@
 """
-Unified Flash Attention interface with automatic FA4/FA3/SDPA switching.
+Unified Flash Attention interface with automatic FA3/SDPA switching.
 
 Exports `flash_attn` module that matches the FA3 API exactly, with:
-  - FA4 on Blackwell (SM100) — flash-attn-4 package
   - FA3 on Hopper (SM90)     — kernels package
   - SDPA fallback elsewhere  — PyTorch built-in
 
@@ -15,28 +14,14 @@ Usage (drop-in replacement for FA3):
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
 """
+import os
 import torch
 import torch.nn.functional as F
 
 
 # =============================================================================
-# Detection: Try to load FA4 (Blackwell SM100) or FA3 (Hopper SM90)
-# Priority: FA4 > FA3 > SDPA
+# Detection: Try to load FA3 (Hopper SM90)
 # =============================================================================
-def _load_flash_attention_4():
-    """Try to load Flash Attention 4 (requires Blackwell GPU, sm100)."""
-    if not torch.cuda.is_available():
-        return None
-    try:
-        major, _ = torch.cuda.get_device_capability()
-        if major < 10:  # FA4 requires SM100+ (Blackwell)
-            return None
-        from flash_attn.cute import flash_attn_func
-        return flash_attn_func
-    except Exception:
-        return None
-
-
 def _load_flash_attention_3():
     """Try to load Flash Attention 3 (requires Hopper GPU, sm90)."""
     if not torch.cuda.is_available():
@@ -47,7 +32,6 @@ def _load_flash_attention_3():
         # Ada (sm89), Blackwell (sm100) need SDPA fallback until FA3 is recompiled
         if major != 9:
             return None
-        import os
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel
         return get_kernel('varunneal/flash-attention-3').flash_attn_interface
@@ -55,43 +39,27 @@ def _load_flash_attention_3():
         return None
 
 
-_fa4_func = _load_flash_attention_4()
 _fa3 = _load_flash_attention_3()
-HAS_FA4 = _fa4_func is not None
 HAS_FA3 = _fa3 is not None
 
-# Override via env var NANOCHAT_ATTN_IMPL='fa4'|'fa3'|'sdpa', or None for auto-detect
-import os
+# Override via env var NANOCHAT_ATTN_IMPL='fa3'|'sdpa', or None for auto-detect
 _override_impl = os.environ.get('NANOCHAT_ATTN_IMPL', None)
 
 
 def _resolve_impl():
-    """Decide which attention implementation to use. Returns 'fa4', 'fa3', or 'sdpa'."""
-    if _override_impl in ('fa4', 'fa3', 'sdpa'):
-        if _override_impl == 'fa4':
-            assert HAS_FA4, "Cannot override to FA4: not available on this hardware"
+    """Decide which attention implementation to use. Returns 'fa3' or 'sdpa'."""
+    if _override_impl in ('fa3', 'sdpa'):
         if _override_impl == 'fa3':
             assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
         return _override_impl
 
     from nanochat.common import COMPUTE_DTYPE
-    if HAS_FA4 and COMPUTE_DTYPE == torch.bfloat16:
-        return 'fa4'
     if HAS_FA3 and COMPUTE_DTYPE == torch.bfloat16:
         return 'fa3'
     return 'sdpa'
 
 _IMPL = _resolve_impl()
-USE_FA4 = _IMPL == 'fa4'
 USE_FA3 = _IMPL == 'fa3'
-
-
-@torch.compiler.disable
-def _call_fa4(q, k, v, causal, window_size):
-    # FA4 uses (None, None) for unlimited context, not (-1, -1) like FA3
-    ws = tuple(None if w == -1 else w for w in window_size)
-    out = _fa4_func(q, k, v, causal=causal, window_size=ws)
-    return out[0] if isinstance(out, tuple) else out
 
 
 # =============================================================================
@@ -147,8 +115,6 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if USE_FA4:
-        return _call_fa4(q, k, v, causal, window_size)
     if USE_FA3:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
@@ -179,7 +145,6 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
-    # FA4 does not provide flash_attn_with_kvcache — fall through to SDPA for inference
     if USE_FA3:
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
@@ -187,10 +152,10 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
         )
 
     # SDPA fallback: manually manage KV cache
-    B, T_new, H, D = q.shape
     pos = cache_seqlens[0].item()  # assume uniform position across batch
 
     # Insert new k, v into cache (in-place, matching FA3 behavior)
+    T_new = q.shape[1]
     if k is not None and v is not None:
         k_cache[:, pos:pos+T_new, :, :] = k
         v_cache[:, pos:pos+T_new, :, :] = v
@@ -212,7 +177,7 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
 
 
 # =============================================================================
-# Export: flash_attn module interface (drop-in replacement for FA3/FA4)
+# Export: flash_attn module interface (drop-in replacement for FA3)
 # =============================================================================
 from types import SimpleNamespace
 flash_attn = SimpleNamespace(
